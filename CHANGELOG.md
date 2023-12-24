@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.29.0](https://github.com/Koenkk/zigbee-herdsman/compare/v0.28.0...v0.29.0) (2023-12-24)
+
+
+### Features
+
+* **ignore:** Add Amazon Work With All Hubs cluster ([#839](https://github.com/Koenkk/zigbee-herdsman/issues/839)) ([854fd12](https://github.com/Koenkk/zigbee-herdsman/commit/854fd12c08ea9dea97e4a05d2de22ef5419a7dfe))
+
 ## [0.28.0](https://github.com/Koenkk/zigbee-herdsman/compare/v0.27.1...v0.28.0) (2023-12-23)
 
 
