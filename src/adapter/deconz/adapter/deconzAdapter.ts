@@ -9,25 +9,11 @@ import {Queue, Waitress} from '../../../utils';
 import {logger} from '../../../utils/logger';
 import {BroadcastAddress} from '../../../zspec/enums';
 import * as Zcl from '../../../zspec/zcl';
+import * as Zdo from '../../../zspec/zdo';
+import {SimpleDescriptorResponse} from '../../../zspec/zdo/definition/tstypes';
 import Adapter from '../../adapter';
 import * as Events from '../../events';
-import {
-    ActiveEndpoints,
-    AdapterOptions,
-    Coordinator,
-    CoordinatorVersion,
-    DeviceType,
-    LQI,
-    LQINeighbor,
-    NetworkOptions,
-    NetworkParameters,
-    NodeDescriptor,
-    RoutingTable,
-    RoutingTableEntry,
-    SerialPortOptions,
-    SimpleDescriptor,
-    StartResult,
-} from '../../tstype';
+import {AdapterOptions, Coordinator, CoordinatorVersion, NetworkOptions, NetworkParameters, SerialPortOptions, StartResult} from '../../tstype';
 import PARAM, {ApsDataRequest, gpDataInd, ReceivedDataResponse, WaitForDataRequest} from '../driver/constants';
 import Driver from '../driver/driver';
 import processFrame, {frameParserEvents} from '../driver/frameParser';
@@ -287,39 +273,29 @@ class DeconzAdapter extends Adapter {
     }
 
     public async permitJoin(seconds: number, networkAddress?: number): Promise<void> {
-        const transactionID = this.nextTransactionID();
-        const request: ApsDataRequest = {};
-        const zdpFrame = [transactionID, seconds, 0]; // tc_significance 1 or 0 ?
+        // TODO: logic reworked to match other stack (proper dropdown support), needs verifying
+        if (networkAddress) {
+            // `authentication`: TC significance always 1 (zb specs)
+            const zdoPayload = Zdo.Buffalo.buildRequest(Zdo.ClusterId.PERMIT_JOINING_REQUEST, this.hasZdoMessageOverhead, seconds, 1, []);
 
-        request.requestId = transactionID;
-        request.destAddrMode = PARAM.PARAM.addressMode.NWK_ADDR;
-        request.destAddr16 = networkAddress || 0xfffc;
-        request.destEndpoint = 0;
-        request.profileId = 0;
-        request.clusterId = 0x36; // permit join
-        request.srcEndpoint = 0;
-        request.asduLength = 3;
-        request.asduPayload = zdpFrame;
-        request.txOptions = 0;
-        request.radius = PARAM.PARAM.txRadius.DEFAULT_RADIUS;
-        request.timeout = 5;
-
-        try {
-            await this.driver.enqueueSendDataRequest(request);
-            if (seconds === 0) {
-                this.joinPermitted = false;
-            } else {
-                this.joinPermitted = true;
-            }
+            await this.sendZdo(ZSpec.BLANK_EUI64, networkAddress, Zdo.ClusterId.PERMIT_JOINING_REQUEST, zdoPayload, false);
+        } else {
+            // TODO: assuming this is permit join on coordinator?
             await this.driver.writeParameterRequest(PARAM.PARAM.Network.PERMIT_JOIN, seconds);
 
-            logger.debug('PERMIT_JOIN - ' + seconds + ' seconds', NS);
-        } catch (error) {
-            const msg = 'PERMIT_JOIN FAILED - ' + error;
-            logger.debug(msg, NS);
-            // try again
-            await this.permitJoin(seconds, networkAddress);
-            //return Promise.reject(new Error(msg)); // do not reject
+            // broadcast permit joining ZDO
+            if (networkAddress === undefined) {
+                // `authentication`: TC significance always 1 (zb specs)
+                const zdoPayload = Zdo.Buffalo.buildRequest(Zdo.ClusterId.PERMIT_JOINING_REQUEST, this.hasZdoMessageOverhead, seconds, 1, []);
+
+                await this.sendZdo(ZSpec.BLANK_EUI64, ZSpec.BroadcastAddress.DEFAULT, Zdo.ClusterId.PERMIT_JOINING_REQUEST, zdoPayload, true);
+            }
+        }
+
+        if (seconds === 0) {
+            this.joinPermitted = false;
+        } else {
+            this.joinPermitted = true;
         }
     }
 
@@ -359,407 +335,21 @@ class DeconzAdapter extends Adapter {
         return Promise.reject(new Error('Reset is not supported'));
     }
 
-    public async lqi(networkAddress: number): Promise<LQI> {
-        const neighbors: LQINeighbor[] = [];
-
-        const add = (list: Buffer[]): void => {
-            for (const entry of list) {
-                const relationByte = entry.readUInt8(18);
-                const extAddr: number[] = [];
-                for (let i = 8; i < 16; i++) {
-                    extAddr.push(entry[i]);
-                }
-
-                neighbors.push({
-                    linkquality: entry.readUInt8(21),
-                    networkAddress: entry.readUInt16LE(16),
-                    ieeeAddr: this.driver.macAddrArrayToString(extAddr),
-                    relationship: (relationByte >> 1) & ((1 << 3) - 1),
-                    depth: entry.readUInt8(20),
-                });
-            }
-        };
-
-        const request = async (
-            startIndex: number,
-        ): Promise<{
-            status: number;
-            tableEntrys: number;
-            startIndex: number;
-            tableListCount: number;
-            tableList: Buffer[];
-        }> => {
-            const transactionID = this.nextTransactionID();
-            const req: ApsDataRequest = {};
-            req.requestId = transactionID;
-            req.destAddrMode = PARAM.PARAM.addressMode.NWK_ADDR;
-            req.destAddr16 = networkAddress;
-            req.destEndpoint = 0;
-            req.profileId = 0;
-            req.clusterId = 0x31; // mgmt_lqi_request
-            req.srcEndpoint = 0;
-            req.asduLength = 2;
-            req.asduPayload = [transactionID, startIndex];
-            req.txOptions = 0;
-            req.radius = PARAM.PARAM.txRadius.DEFAULT_RADIUS;
-
-            this.driver
-                .enqueueSendDataRequest(req)
-                .then(() => {})
-                .catch(() => {});
-
-            try {
-                const d = await this.waitForData(networkAddress, 0, 0x8031);
-                const data = d.asduPayload!;
-
-                if (data[1] !== 0) {
-                    // status
-                    throw new Error(`LQI for '${networkAddress}' failed`);
-                }
-                const tableList: Buffer[] = [];
-                const response = {
-                    status: data[1],
-                    tableEntrys: data[2],
-                    startIndex: data[3],
-                    tableListCount: data[4],
-                    tableList: tableList,
-                };
-
-                let tableEntry: number[] = [];
-                let counter = 0;
-                for (let i = 5; i < response.tableListCount * 22 + 5; i++) {
-                    // one tableentry = 22 bytes
-                    tableEntry.push(data[i]);
-                    counter++;
-                    if (counter === 22) {
-                        response.tableList.push(Buffer.from(tableEntry));
-                        tableEntry = [];
-                        counter = 0;
-                    }
-                }
-
-                logger.debug(
-                    'LQI RESPONSE - addr: 0x' +
-                        networkAddress.toString(16) +
-                        ' status: ' +
-                        response.status +
-                        ' read ' +
-                        (response.tableListCount + response.startIndex) +
-                        '/' +
-                        response.tableEntrys +
-                        ' entrys',
-                    NS,
-                );
-                return response;
-            } catch (error) {
-                const msg = 'LQI REQUEST FAILED - addr: 0x' + networkAddress.toString(16) + ' ' + error;
-                logger.debug(msg, NS);
-                return Promise.reject(new Error(msg));
-            }
-        };
-
-        let response = await request(0);
-        add(response.tableList);
-        let nextStartIndex = response.tableListCount;
-
-        while (neighbors.length < response.tableEntrys) {
-            response = await request(nextStartIndex);
-            add(response.tableList);
-            nextStartIndex += response.tableListCount;
-        }
-
-        return {neighbors};
-    }
-
-    public async routingTable(networkAddress: number): Promise<RoutingTable> {
-        const table: RoutingTableEntry[] = [];
-        const statusLookup: {[n: number]: string} = {
-            0: 'ACTIVE',
-            1: 'DISCOVERY_UNDERWAY',
-            2: 'DISCOVERY_FAILED',
-            3: 'INACTIVE',
-        };
-        const add = (list: Buffer[]): void => {
-            for (const entry of list) {
-                const statusByte = entry.readUInt8(2);
-                const extAddr: number[] = [];
-                for (let i = 8; i < 16; i++) {
-                    extAddr.push(entry[i]);
-                }
-
-                table.push({
-                    destinationAddress: entry.readUInt16LE(0),
-                    status: statusLookup[(statusByte >> 5) & ((1 << 3) - 1)],
-                    nextHop: entry.readUInt16LE(3),
-                });
-            }
-        };
-
-        const request = async (
-            startIndex: number,
-        ): Promise<{
-            status: number;
-            tableEntrys: number;
-            startIndex: number;
-            tableListCount: number;
-            tableList: Buffer[];
-        }> => {
-            const transactionID = this.nextTransactionID();
-            const req: ApsDataRequest = {};
-            req.requestId = transactionID;
-            req.destAddrMode = PARAM.PARAM.addressMode.NWK_ADDR;
-            req.destAddr16 = networkAddress;
-            req.destEndpoint = 0;
-            req.profileId = 0;
-            req.clusterId = 0x32; // mgmt_rtg_request
-            req.srcEndpoint = 0;
-            req.asduLength = 2;
-            req.asduPayload = [transactionID, startIndex];
-            req.txOptions = 0;
-            req.radius = PARAM.PARAM.txRadius.DEFAULT_RADIUS;
-            req.timeout = 30;
-
-            this.driver
-                .enqueueSendDataRequest(req)
-                .then(() => {})
-                .catch(() => {});
-
-            try {
-                const d = await this.waitForData(networkAddress, 0, 0x8032);
-                const data = d.asduPayload!;
-
-                if (data[1] !== 0) {
-                    // status
-                    throw new Error(`Routingtables for '${networkAddress}' failed`);
-                }
-                const tableList: Buffer[] = [];
-                const response = {
-                    status: data[1],
-                    tableEntrys: data[2],
-                    startIndex: data[3],
-                    tableListCount: data[4],
-                    tableList: tableList,
-                };
-
-                let tableEntry: number[] = [];
-                let counter = 0;
-                for (let i = 5; i < response.tableListCount * 5 + 5; i++) {
-                    // one tableentry = 5 bytes
-                    tableEntry.push(data[i]);
-                    counter++;
-                    if (counter === 5) {
-                        response.tableList.push(Buffer.from(tableEntry));
-                        tableEntry = [];
-                        counter = 0;
-                    }
-                }
-
-                logger.debug(
-                    'ROUTING_TABLE RESPONSE - addr: 0x' +
-                        networkAddress.toString(16) +
-                        ' status: ' +
-                        response.status +
-                        ' read ' +
-                        (response.tableListCount + response.startIndex) +
-                        '/' +
-                        response.tableEntrys +
-                        ' entrys',
-                    NS,
-                );
-                return response;
-            } catch (error) {
-                const msg = 'ROUTING_TABLE REQUEST FAILED - addr: 0x' + networkAddress.toString(16) + ' ' + error;
-                logger.debug(msg, NS);
-                return Promise.reject(new Error(msg));
-            }
-        };
-
-        let response = await request(0);
-        add(response.tableList);
-        let nextStartIndex = response.tableListCount;
-
-        while (table.length < response.tableEntrys) {
-            response = await request(nextStartIndex);
-            add(response.tableList);
-            nextStartIndex += response.tableListCount;
-        }
-
-        return {table};
-    }
-
-    public async nodeDescriptor(networkAddress: number): Promise<NodeDescriptor> {
-        const transactionID = this.nextTransactionID();
-        const nwk1 = networkAddress & 0xff;
-        const nwk2 = (networkAddress >> 8) & 0xff;
-        const request: ApsDataRequest = {};
-        const zdpFrame = [transactionID, nwk1, nwk2];
-
-        request.requestId = transactionID;
-        request.destAddrMode = PARAM.PARAM.addressMode.NWK_ADDR;
-        request.destAddr16 = networkAddress;
-        request.destEndpoint = 0;
-        request.profileId = 0;
-        request.clusterId = 0x02; // node descriptor
-        request.srcEndpoint = 0;
-        request.asduLength = 3;
-        request.asduPayload = zdpFrame;
-        request.txOptions = 0;
-        request.radius = PARAM.PARAM.txRadius.DEFAULT_RADIUS;
-        request.timeout = 30;
-
-        this.driver
-            .enqueueSendDataRequest(request)
-            .then(() => {})
-            .catch(() => {});
-
-        try {
-            const d = await this.waitForData(networkAddress, 0, 0x8002);
-            const data = d.asduPayload!;
-
-            const buf = Buffer.from(data);
-            const logicaltype = data[4] & 7;
-            const type: DeviceType = logicaltype === 1 ? 'Router' : logicaltype === 2 ? 'EndDevice' : logicaltype === 0 ? 'Coordinator' : 'Unknown';
-            const manufacturer = buf.readUInt16LE(7);
-
-            logger.debug(
-                'RECEIVING NODE_DESCRIPTOR - addr: 0x' +
-                    networkAddress.toString(16) +
-                    ' type: ' +
-                    type +
-                    ' manufacturer: 0x' +
-                    manufacturer.toString(16),
-                NS,
-            );
-            return {manufacturerCode: manufacturer, type};
-        } catch (error) {
-            const msg = 'RECEIVING NODE_DESCRIPTOR FAILED - addr: 0x' + networkAddress.toString(16) + ' ' + error;
-            logger.debug(msg, NS);
-            return Promise.reject(new Error(msg));
-        }
-    }
-
-    public async activeEndpoints(networkAddress: number): Promise<ActiveEndpoints> {
-        const transactionID = this.nextTransactionID();
-        const nwk1 = networkAddress & 0xff;
-        const nwk2 = (networkAddress >> 8) & 0xff;
-        const request: ApsDataRequest = {};
-        const zdpFrame = [transactionID, nwk1, nwk2];
-
-        request.requestId = transactionID;
-        request.destAddrMode = PARAM.PARAM.addressMode.NWK_ADDR;
-        request.destAddr16 = networkAddress;
-        request.destEndpoint = 0;
-        request.profileId = 0;
-        request.clusterId = 0x05; // active endpoints
-        request.srcEndpoint = 0;
-        request.asduLength = 3;
-        request.asduPayload = zdpFrame;
-        request.txOptions = 0;
-        request.radius = PARAM.PARAM.txRadius.DEFAULT_RADIUS;
-        request.timeout = 30;
-
-        this.driver
-            .enqueueSendDataRequest(request)
-            .then(() => {})
-            .catch(() => {});
-
-        try {
-            const d = await this.waitForData(networkAddress, 0, 0x8005);
-            const data = d.asduPayload;
-
-            const buf = Buffer.from(data!);
-            const epCount = buf.readUInt8(4);
-            const epList = [];
-            for (let i = 5; i < epCount + 5; i++) {
-                epList.push(buf.readUInt8(i));
-            }
-            logger.debug('ACTIVE_ENDPOINTS - addr: 0x' + networkAddress.toString(16) + ' EP list: ' + epList, NS);
-            return {endpoints: epList};
-        } catch (error) {
-            const msg = 'READING ACTIVE_ENDPOINTS FAILED - addr: 0x' + networkAddress.toString(16) + ' ' + error;
-            logger.debug(msg, NS);
-            return Promise.reject(new Error(msg));
-        }
-    }
-
-    public async simpleDescriptor(networkAddress: number, endpointID: number): Promise<SimpleDescriptor> {
-        const transactionID = this.nextTransactionID();
-        const nwk1 = networkAddress & 0xff;
-        const nwk2 = (networkAddress >> 8) & 0xff;
-        const request: ApsDataRequest = {};
-        const zdpFrame = [transactionID, nwk1, nwk2, endpointID];
-
-        request.requestId = transactionID;
-        request.destAddrMode = PARAM.PARAM.addressMode.NWK_ADDR;
-        request.destAddr16 = networkAddress;
-        request.destEndpoint = 0;
-        request.profileId = 0;
-        request.clusterId = 0x04; // simple descriptor
-        request.srcEndpoint = 0;
-        request.asduLength = 4;
-        request.asduPayload = zdpFrame;
-        request.txOptions = 0;
-        request.radius = PARAM.PARAM.txRadius.DEFAULT_RADIUS;
-        request.timeout = 30;
-
-        this.driver
-            .enqueueSendDataRequest(request)
-            .then(() => {})
-            .catch(() => {});
-
-        try {
-            const d = await this.waitForData(networkAddress, 0, 0x8004);
-            const data = d.asduPayload!;
-
-            const buf = Buffer.from(data);
-            const inCount = buf.readUInt8(11);
-            const inClusters = [];
-            let cIndex = 12;
-            for (let i = 0; i < inCount; i++) {
-                inClusters[i] = buf.readUInt16LE(cIndex);
-                cIndex += 2;
-            }
-            const outCount = buf.readUInt8(12 + inCount * 2);
-            const outClusters = [];
-            cIndex = 13 + inCount * 2;
-            for (let l = 0; l < outCount; l++) {
-                outClusters[l] = buf.readUInt16LE(cIndex);
-                cIndex += 2;
-            }
-
-            const simpleDesc = {
-                profileID: buf.readUInt16LE(6),
-                endpointID: buf.readUInt8(5),
-                deviceID: buf.readUInt16LE(8),
-                inputClusters: inClusters,
-                outputClusters: outClusters,
-            };
-            logger.debug(
-                'RECEIVING SIMPLE_DESCRIPTOR - addr: 0x' +
-                    networkAddress.toString(16) +
-                    ' EP:' +
-                    simpleDesc.endpointID +
-                    ' inClusters: ' +
-                    inClusters +
-                    ' outClusters: ' +
-                    outClusters,
-                NS,
-            );
-            return simpleDesc;
-        } catch (error) {
-            const msg = 'RECEIVING SIMPLE_DESCRIPTOR FAILED - addr: 0x' + networkAddress.toString(16) + ' ' + error;
-            logger.debug(msg, NS);
-            return Promise.reject(new Error(msg));
-        }
-    }
-
     private async checkCoordinatorSimpleDescriptor(skip: boolean): Promise<void> {
         logger.debug('checking coordinator simple descriptor', NS);
-        let simpleDesc: SimpleDescriptor | undefined;
+        let simpleDesc: SimpleDescriptorResponse | undefined;
 
         if (skip === false) {
             try {
-                simpleDesc = await this.simpleDescriptor(0x0, 1);
+                const clusterId = Zdo.ClusterId.SIMPLE_DESCRIPTOR_REQUEST;
+                const zdoPayload = Zdo.Buffalo.buildRequest(clusterId, this.hasZdoMessageOverhead, ZSpec.COORDINATOR_ADDRESS, 1);
+                simpleDesc = await this.sendZdo<SimpleDescriptorResponse>(
+                    ZSpec.BLANK_EUI64 /* unused */,
+                    ZSpec.COORDINATOR_ADDRESS,
+                    clusterId,
+                    zdoPayload,
+                    false,
+                );
             } catch {
                 /* empty */
             }
@@ -768,29 +358,32 @@ class DeconzAdapter extends Adapter {
                 await this.checkCoordinatorSimpleDescriptor(false);
                 return;
             }
-            logger.debug('EP: ' + simpleDesc.endpointID, NS);
-            logger.debug('profile ID: ' + simpleDesc.profileID, NS);
-            logger.debug('device ID: ' + simpleDesc.deviceID, NS);
-            for (let i = 0; i < simpleDesc.inputClusters.length; i++) {
-                logger.debug('input cluster: 0x' + simpleDesc.inputClusters[i].toString(16), NS);
+
+            logger.debug('EP: ' + simpleDesc.endpoint, NS);
+            logger.debug('profile ID: ' + simpleDesc.profileId, NS);
+            logger.debug('device ID: ' + simpleDesc.deviceId, NS);
+
+            for (let i = 0; i < simpleDesc.inClusterList.length; i++) {
+                logger.debug('input cluster: 0x' + simpleDesc.inClusterList[i].toString(16), NS);
             }
 
-            for (let o = 0; o < simpleDesc.outputClusters.length; o++) {
-                logger.debug('output cluster: 0x' + simpleDesc.outputClusters[o].toString(16), NS);
+            for (let o = 0; o < simpleDesc.outClusterList.length; o++) {
+                logger.debug('output cluster: 0x' + simpleDesc.outClusterList[o].toString(16), NS);
             }
 
             let ok = true;
-            if (simpleDesc.endpointID === 0x1) {
+
+            if (simpleDesc.endpoint === 0x1) {
                 if (
-                    !simpleDesc.inputClusters.includes(0x0) ||
-                    !simpleDesc.inputClusters.includes(0x0a) ||
-                    !simpleDesc.inputClusters.includes(0x06) ||
-                    !simpleDesc.inputClusters.includes(0x19) ||
-                    !simpleDesc.inputClusters.includes(0x0501) ||
-                    !simpleDesc.outputClusters.includes(0x01) ||
-                    !simpleDesc.outputClusters.includes(0x20) ||
-                    !simpleDesc.outputClusters.includes(0x500) ||
-                    !simpleDesc.outputClusters.includes(0x502)
+                    !simpleDesc.inClusterList.includes(0x0) ||
+                    !simpleDesc.inClusterList.includes(0x0a) ||
+                    !simpleDesc.inClusterList.includes(0x06) ||
+                    !simpleDesc.inClusterList.includes(0x19) ||
+                    !simpleDesc.inClusterList.includes(0x0501) ||
+                    !simpleDesc.outClusterList.includes(0x01) ||
+                    !simpleDesc.outClusterList.includes(0x20) ||
+                    !simpleDesc.outClusterList.includes(0x500) ||
+                    !simpleDesc.outClusterList.includes(0x502)
                 ) {
                     logger.debug('missing cluster', NS);
                     ok = false;
@@ -803,6 +396,7 @@ class DeconzAdapter extends Adapter {
         }
 
         logger.debug('setting new simple descriptor', NS);
+
         try {
             //[ sd1   ep    proId       devId       vers  #inCl iCl1        iCl2        iCl3        iCl4        iCl5        #outC oCl1        oCl2        oCl3        oCl4      ]
             const sd = [
@@ -810,12 +404,15 @@ class DeconzAdapter extends Adapter {
                 0x00, 0x00, 0x05, 0x02, 0x05,
             ];
             const sd1 = sd.reverse();
+
             await this.driver.writeParameterRequest(PARAM.PARAM.STK.Endpoint, sd1);
         } catch (error) {
             logger.debug(`error setting simple descriptor: ${error} - try again`, NS);
             await this.checkCoordinatorSimpleDescriptor(true);
+
             return;
         }
+
         logger.debug('success setting simple descriptor', NS);
     }
 
@@ -981,165 +578,60 @@ class DeconzAdapter extends Adapter {
         return this.driver.enqueueSendDataRequest(request) as Promise<void>;
     }
 
-    public async bind(
-        destinationNetworkAddress: number,
-        sourceIeeeAddress: string,
-        sourceEndpoint: number,
-        clusterID: number,
-        destinationAddressOrGroup: string | number,
-        type: 'endpoint' | 'group',
-        destinationEndpoint?: number,
-    ): Promise<void> {
+    public async sendZdo(
+        ieeeAddress: string,
+        networkAddress: number,
+        clusterId: Zdo.ClusterId,
+        payload: Buffer,
+        disableResponse: boolean,
+    ): Promise<void>;
+    public async sendZdo<T>(
+        ieeeAddress: string,
+        networkAddress: number,
+        clusterId: Zdo.ClusterId,
+        payload: Buffer,
+        disableResponse: boolean,
+    ): Promise<T>;
+    public async sendZdo<T>(
+        ieeeAddress: string,
+        networkAddress: number,
+        clusterId: Zdo.ClusterId,
+        payload: Buffer,
+        disableResponse: boolean,
+    ): Promise<T | void> {
         const transactionID = this.nextTransactionID();
-        const clid1 = clusterID & 0xff;
-        const clid2 = (clusterID >> 8) & 0xff;
-        const destAddrMode = type === 'group' ? PARAM.PARAM.addressMode.GROUP_ADDR : PARAM.PARAM.addressMode.IEEE_ADDR;
-        let destArray: number[];
-
-        if (type === 'endpoint') {
-            assert(destinationEndpoint, 'Destination endpoint must be defined when `type === endpoint`');
-            destArray = this.driver.macAddrStringToArray(destinationAddressOrGroup as string);
-            destArray = destArray.concat([destinationEndpoint]);
-        } else {
-            destArray = [destinationAddressOrGroup as number & 0xff, ((destinationAddressOrGroup as number) >> 8) & 0xff];
-        }
-        const request: ApsDataRequest = {};
-        const zdpFrame = [transactionID]
-            .concat(this.driver.macAddrStringToArray(sourceIeeeAddress))
-            .concat([sourceEndpoint, clid1, clid2, destAddrMode])
-            .concat(destArray);
-
-        request.requestId = transactionID;
-        request.destAddrMode = PARAM.PARAM.addressMode.NWK_ADDR;
-        request.destAddr16 = destinationNetworkAddress;
-        request.destEndpoint = 0;
-        request.profileId = 0;
-        request.clusterId = 0x21; // bind_request
-        request.srcEndpoint = 0;
-        request.asduLength = zdpFrame.length;
-        request.asduPayload = zdpFrame;
-        request.txOptions = 0x04; // 0x04 use APS ACKS
-        request.radius = PARAM.PARAM.txRadius.DEFAULT_RADIUS;
-        request.timeout = 30;
+        payload[0] = transactionID;
+        const req: ApsDataRequest = {
+            requestId: transactionID,
+            destAddrMode: PARAM.PARAM.addressMode.NWK_ADDR,
+            destAddr16: networkAddress,
+            destEndpoint: 0,
+            profileId: 0,
+            clusterId,
+            srcEndpoint: 0,
+            asduLength: payload.length,
+            asduPayload: Array.from(payload),
+            txOptions: 0,
+            radius: PARAM.PARAM.txRadius.DEFAULT_RADIUS,
+            timeout: 30,
+        };
 
         this.driver
-            .enqueueSendDataRequest(request)
+            .enqueueSendDataRequest(req)
             .then(() => {})
             .catch(() => {});
 
-        try {
-            const d = await this.waitForData(destinationNetworkAddress, 0, 0x8021);
-            const data = d.asduPayload!;
-            logger.debug('BIND RESPONSE - addr: 0x' + destinationNetworkAddress.toString(16) + ' status: ' + data[1], NS);
-            if (data[1] !== 0) {
-                throw new Error('status: ' + data[1]);
+        if (!disableResponse) {
+            const responseClusterId = Zdo.Utils.getResponseClusterId(clusterId);
+
+            if (responseClusterId) {
+                try {
+                    // TODO: response from Zdo.Buffalo
+                    const response = await this.waitForData(networkAddress, Zdo.ZDO_PROFILE_ID, responseClusterId);
+                } catch (error) {
+                    // TODO
+                }
             }
-        } catch (error) {
-            logger.debug('BIND FAILED - addr: 0x' + destinationNetworkAddress.toString(16) + ' ' + error, NS);
-            throw error;
-        }
-    }
-
-    public async unbind(
-        destinationNetworkAddress: number,
-        sourceIeeeAddress: string,
-        sourceEndpoint: number,
-        clusterID: number,
-        destinationAddressOrGroup: string | number,
-        type: 'endpoint' | 'group',
-        destinationEndpoint?: number,
-    ): Promise<void> {
-        const transactionID = this.nextTransactionID();
-        const clid1 = clusterID & 0xff;
-        const clid2 = (clusterID >> 8) & 0xff;
-        const destAddrMode = type === 'group' ? PARAM.PARAM.addressMode.GROUP_ADDR : PARAM.PARAM.addressMode.IEEE_ADDR;
-        let destArray: number[];
-
-        if (type === 'endpoint') {
-            assert(destinationEndpoint, 'Destination endpoint must be defined when `type === endpoint`');
-            destArray = this.driver.macAddrStringToArray(destinationAddressOrGroup as string);
-            destArray = destArray.concat([destinationEndpoint]);
-        } else {
-            destArray = [destinationAddressOrGroup as number & 0xff, ((destinationAddressOrGroup as number) >> 8) & 0xff];
-        }
-
-        const request: ApsDataRequest = {};
-        const zdpFrame = [transactionID]
-            .concat(this.driver.macAddrStringToArray(sourceIeeeAddress))
-            .concat([sourceEndpoint, clid1, clid2, destAddrMode])
-            .concat(destArray);
-
-        request.requestId = transactionID;
-        request.destAddrMode = PARAM.PARAM.addressMode.NWK_ADDR;
-        request.destAddr16 = destinationNetworkAddress;
-        request.destEndpoint = 0;
-        request.profileId = 0;
-        request.clusterId = 0x22; // unbind_request
-        request.srcEndpoint = 0;
-        request.asduLength = zdpFrame.length;
-        request.asduPayload = zdpFrame;
-        request.txOptions = 0x04; // 0x04 use APS ACKS
-        request.radius = PARAM.PARAM.txRadius.DEFAULT_RADIUS;
-        request.timeout = 30;
-
-        this.driver
-            .enqueueSendDataRequest(request)
-            .then(() => {})
-            .catch(() => {});
-
-        try {
-            const d = await this.waitForData(destinationNetworkAddress, 0, 0x8022);
-            const data = d.asduPayload!;
-            logger.debug('UNBIND RESPONSE - addr: 0x' + destinationNetworkAddress.toString(16) + ' status: ' + data[1], NS);
-            if (data[1] !== 0) {
-                throw new Error('status: ' + data[1]);
-            }
-        } catch (error) {
-            logger.debug('UNBIND FAILED - addr: 0x' + destinationNetworkAddress.toString(16) + ' ' + error, NS);
-            throw error;
-        }
-    }
-
-    public async removeDevice(networkAddress: number, ieeeAddr: string): Promise<void> {
-        const transactionID = this.nextTransactionID();
-        // const nwk1 = networkAddress & 0xff;
-        // const nwk2 = (networkAddress >> 8) & 0xff;
-        const request: ApsDataRequest = {};
-        //const zdpFrame = [transactionID].concat(this.driver.macAddrStringToArray(ieeeAddr)).concat([0]);
-        const zdpFrame = [transactionID].concat([0, 0, 0, 0, 0, 0, 0, 0]).concat([0]);
-
-        request.requestId = transactionID;
-        request.destAddrMode = PARAM.PARAM.addressMode.NWK_ADDR;
-        request.destAddr16 = networkAddress;
-        request.destEndpoint = 0;
-        request.profileId = 0;
-        request.clusterId = 0x34; // mgmt_leave_request
-        request.srcEndpoint = 0;
-        request.asduLength = 10;
-        request.asduPayload = zdpFrame;
-        request.txOptions = 0;
-        request.radius = PARAM.PARAM.txRadius.DEFAULT_RADIUS;
-
-        this.driver
-            .enqueueSendDataRequest(request)
-            .then(() => {})
-            .catch(() => {});
-
-        try {
-            const d = await this.waitForData(networkAddress, 0, 0x8034);
-            const data = d.asduPayload!;
-            logger.debug('REMOVE_DEVICE - addr: 0x' + networkAddress.toString(16) + ' status: ' + data[1], NS);
-            const payload: Events.DeviceLeavePayload = {
-                networkAddress: networkAddress,
-                ieeeAddr: ieeeAddr,
-            };
-            if (data[1] !== 0) {
-                throw new Error('status: ' + data[1]);
-            }
-            this.emit('deviceLeave', payload);
-        } catch (error) {
-            logger.debug('REMOVE_DEVICE FAILED - addr: 0x' + networkAddress.toString(16) + ' ' + error, NS);
-            throw error;
         }
     }
 
@@ -1190,11 +682,6 @@ class DeconzAdapter extends Adapter {
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     public async setChannelInterPAN(channel: number): Promise<void> {
         throw new Error('not supported');
-    }
-
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    public async changeChannel(newChannel: number): Promise<void> {
-        throw new Error(`Channel change is not supported for 'deconz'`);
     }
 
     // eslint-disable-next-line @typescript-eslint/no-unused-vars

@@ -1,11 +1,16 @@
 import assert from 'assert';
 
 import {Events as AdapterEvents} from '../../adapter';
+import {LQINeighbor, RoutingTableEntry} from '../../adapter/tstype';
 import {Wait} from '../../utils';
 import {logger} from '../../utils/logger';
+import * as ZSpec from '../../zspec';
 import {BroadcastAddress} from '../../zspec/enums';
+import {EUI64} from '../../zspec/tstypes';
 import * as Zcl from '../../zspec/zcl';
 import {ClusterDefinition, CustomClusters} from '../../zspec/zcl/definition/tstype';
+import * as Zdo from '../../zspec/zdo';
+import * as ZdoTypes from '../../zspec/zdo/definition/tstypes';
 import {ControllerEventMap} from '../controller';
 import {ZclFrameConverter} from '../helpers';
 import ZclTransactionSequenceNumber from '../helpers/zclTransactionSequenceNumber';
@@ -32,6 +37,17 @@ interface LQI {
 
 interface RoutingTable {
     table: {destinationAddress: number; status: string; nextHop: number}[];
+}
+
+enum RoutingTableStatus {
+    ACTIVE = 0x0,
+    DISCOVERY_UNDERWAY = 0x1,
+    DISCOVERY_FAILED = 0x2,
+    INACTIVE = 0x3,
+    VALIDATION_UNDERWAY = 0x4,
+    RESERVED1 = 0x5,
+    RESERVED2 = 0x6,
+    RESERVED3 = 0x7,
 }
 
 type CustomReadResponse = (frame: Zcl.Frame, endpoint: Endpoint) => boolean;
@@ -855,19 +871,54 @@ class Device extends Entity<ControllerEventMap> {
     }
 
     private async interviewInternal(ignoreCache: boolean): Promise<void> {
-        const nodeDescriptorQuery = async (): Promise<void> => {
-            const nodeDescriptor = await Entity.adapter!.nodeDescriptor(this.networkAddress);
+        const nodeDescriptorQuery = async (clusterId: Zdo.ClusterId, payload: Buffer): Promise<void> => {
+            const nodeDescriptor = await Entity.adapter!.sendZdo<ZdoTypes.NodeDescriptorResponse>(
+                this.ieeeAddr,
+                this.networkAddress,
+                clusterId,
+                payload,
+                false,
+            );
             this._manufacturerID = nodeDescriptor.manufacturerCode;
-            this._type = nodeDescriptor.type;
+
+            switch (nodeDescriptor.logicalType) {
+                case 0x0:
+                    this._type = 'Coordinator';
+                    break;
+                case 0x1:
+                    this._type = 'Router';
+                    break;
+                case 0x2:
+                    this._type = 'EndDevice';
+                    break;
+                default:
+                    this._type = 'Unknown';
+                    break;
+            }
+
             logger.debug(`Interview - got node descriptor for device '${this.ieeeAddr}'`, NS);
+
+            // log for devices older than 1 from current rev
+            if (nodeDescriptor.serverMask.stackComplianceRevision < ZSpec.ZIGBEE_REVISION - 1) {
+                // always 0 before rev. 21 where field was added
+                const rev = nodeDescriptor.serverMask.stackComplianceRevision < 21 ? 'pre-21' : nodeDescriptor.serverMask.stackComplianceRevision;
+
+                logger.info(
+                    `Device '${this.ieeeAddr}' is only compliant to revision '${rev}' of the ZigBee specification (current revision: ${ZSpec.ZIGBEE_REVISION}).`,
+                    NS,
+                );
+            }
         };
 
         const hasNodeDescriptor = (): boolean => this._manufacturerID !== undefined && this._type !== 'Unknown';
 
         if (ignoreCache || !hasNodeDescriptor()) {
+            const clusterId = Zdo.ClusterId.NODE_DESCRIPTOR_REQUEST;
+            const zdoPayload = Zdo.Buffalo.buildRequest(clusterId, Entity.adapter!.hasZdoMessageOverhead, this.networkAddress);
+
             for (let attempt = 0; attempt < 6; attempt++) {
                 try {
-                    await nodeDescriptorQuery();
+                    await nodeDescriptorQuery(clusterId, zdoPayload);
                     break;
                 } catch (error) {
                     if (this.interviewQuirks()) {
@@ -914,36 +965,57 @@ class Device extends Entity<ControllerEventMap> {
         // e.g. Xiaomi Aqara Opple devices fail to respond to the first active endpoints request, therefore try 2 times
         // https://github.com/Koenkk/zigbee-herdsman/pull/103
         let activeEndpoints;
-        for (let attempt = 0; attempt < 2; attempt++) {
-            try {
-                activeEndpoints = await Entity.adapter!.activeEndpoints(this.networkAddress);
-                break;
-            } catch (error) {
-                logger.debug(`Interview - active endpoints request failed for '${this.ieeeAddr}', attempt ${attempt + 1} (${error})`, NS);
+
+        {
+            const clusterId = Zdo.ClusterId.ACTIVE_ENDPOINTS_REQUEST;
+            const zdoPayload = Zdo.Buffalo.buildRequest(clusterId, Entity.adapter!.hasZdoMessageOverhead, this.networkAddress);
+
+            for (let attempt = 0; attempt < 2; attempt++) {
+                try {
+                    activeEndpoints = await Entity.adapter!.sendZdo<ZdoTypes.ActiveEndpointsResponse>(
+                        this.ieeeAddr,
+                        this.networkAddress,
+                        clusterId,
+                        zdoPayload,
+                        false,
+                    );
+                    break;
+                } catch (error) {
+                    logger.debug(`Interview - active endpoints request failed for '${this.ieeeAddr}', attempt ${attempt + 1} (${error})`, NS);
+                }
             }
         }
+
         if (!activeEndpoints) {
             throw new Error(`Interview failed because can not get active endpoints ('${this.ieeeAddr}')`);
         }
 
         // Make sure that the endpoint are sorted.
-        activeEndpoints.endpoints.sort((a, b) => a - b);
+        activeEndpoints.endpointList.sort((a, b) => a - b);
 
         // Some devices, e.g. TERNCY return endpoint 0 in the active endpoints request.
         // This is not a valid endpoint number according to the ZCL, requesting a simple descriptor will result
         // into an error. Therefore we filter it, more info: https://github.com/Koenkk/zigbee-herdsman/issues/82
-        activeEndpoints.endpoints
+        activeEndpoints.endpointList
             .filter((e) => e !== 0 && !this.getEndpoint(e))
             .forEach((e) => this._endpoints.push(Endpoint.create(e, undefined, undefined, [], [], this.networkAddress, this.ieeeAddr)));
         logger.debug(`Interview - got active endpoints for device '${this.ieeeAddr}'`, NS);
 
-        for (const endpointID of activeEndpoints.endpoints.filter((e) => e !== 0)) {
+        for (const endpointID of activeEndpoints.endpointList.filter((e) => e !== 0)) {
             const endpoint = this.getEndpoint(endpointID)!; // XXX: should never be undefined?
-            const simpleDescriptor = await Entity.adapter!.simpleDescriptor(this.networkAddress, endpoint.ID);
-            endpoint.profileID = simpleDescriptor.profileID;
-            endpoint.deviceID = simpleDescriptor.deviceID;
-            endpoint.inputClusters = simpleDescriptor.inputClusters;
-            endpoint.outputClusters = simpleDescriptor.outputClusters;
+            const clusterId = Zdo.ClusterId.SIMPLE_DESCRIPTOR_REQUEST;
+            const zdoPayload = Zdo.Buffalo.buildRequest(clusterId, Entity.adapter!.hasZdoMessageOverhead, this.networkAddress, endpoint.ID);
+            const simpleDescriptor = await Entity.adapter!.sendZdo<ZdoTypes.SimpleDescriptorResponse>(
+                this.ieeeAddr,
+                this.networkAddress,
+                clusterId,
+                zdoPayload,
+                false,
+            );
+            endpoint.profileID = simpleDescriptor.profileId;
+            endpoint.deviceID = simpleDescriptor.deviceId;
+            endpoint.inputClusters = simpleDescriptor.inClusterList;
+            endpoint.outputClusters = simpleDescriptor.outClusterList;
             logger.debug(`Interview - got simple descriptor for endpoint '${endpoint.ID}' device '${this.ieeeAddr}'`, NS);
 
             // Read attributes, nice to have but not required for succesfull pairing as most of the attributes
@@ -1045,6 +1117,19 @@ class Device extends Entity<ControllerEventMap> {
         }
     }
 
+    public async requestNetworkAddress(): Promise<ZdoTypes.NetworkAddressResponse> {
+        const clusterId = Zdo.ClusterId.NETWORK_ADDRESS_REQUEST;
+        const zdoPayload = Zdo.Buffalo.buildRequest(clusterId, Entity.adapter!.hasZdoMessageOverhead, this.ieeeAddr as EUI64, false, 0);
+
+        return Entity.adapter!.sendZdo<ZdoTypes.NetworkAddressResponse>(
+            this.ieeeAddr,
+            this.networkAddress /* ignored */,
+            clusterId,
+            zdoPayload,
+            false,
+        );
+    }
+
     public async removeFromNetwork(): Promise<void> {
         if (this._type === 'GreenPower') {
             const payload = {
@@ -1065,7 +1150,18 @@ class Device extends Entity<ControllerEventMap> {
             );
 
             await Entity.adapter!.sendZclFrameToAll(242, frame, 242, BroadcastAddress.RX_ON_WHEN_IDLE);
-        } else await Entity.adapter!.removeDevice(this.networkAddress, this.ieeeAddr);
+        } else {
+            const clusterId = Zdo.ClusterId.LEAVE_REQUEST;
+            const zdoPayload = Zdo.Buffalo.buildRequest(
+                clusterId,
+                Entity.adapter!.hasZdoMessageOverhead,
+                this.ieeeAddr as EUI64,
+                Zdo.LeaveRequestFlags.WITHOUT_REJOIN,
+            );
+
+            await Entity.adapter!.sendZdo(this.ieeeAddr, this.networkAddress, clusterId, zdoPayload, false);
+        }
+
         this.removeFromDatabase();
     }
 
@@ -1105,11 +1201,75 @@ class Device extends Entity<ControllerEventMap> {
     }
 
     public async lqi(): Promise<LQI> {
-        return Entity.adapter!.lqi(this.networkAddress);
+        const clusterId = Zdo.ClusterId.LQI_TABLE_REQUEST;
+        const neighbors: LQINeighbor[] = [];
+        const request = async (startIndex: number): Promise<[tableEntries: number, entryCount: number]> => {
+            const zdoPayload = Zdo.Buffalo.buildRequest(clusterId, Entity.adapter!.hasZdoMessageOverhead, startIndex);
+            const result = await Entity.adapter!.sendZdo<ZdoTypes.LQITableResponse>(this.ieeeAddr, this.networkAddress, clusterId, zdoPayload, false);
+
+            for (const entry of result.entryList) {
+                neighbors.push({
+                    ieeeAddr: entry.eui64,
+                    networkAddress: entry.nwkAddress,
+                    linkquality: entry.lqi,
+                    relationship: entry.relationship,
+                    depth: entry.depth,
+                });
+            }
+
+            return [result.neighborTableEntries, result.entryList.length];
+        };
+
+        let [tableEntries, entryCount] = await request(0);
+
+        const size = tableEntries;
+        let nextStartIndex = entryCount;
+
+        while (neighbors.length < size) {
+            [tableEntries, entryCount] = await request(nextStartIndex);
+
+            nextStartIndex += entryCount;
+        }
+
+        return {neighbors};
     }
 
     public async routingTable(): Promise<RoutingTable> {
-        return Entity.adapter!.routingTable(this.networkAddress);
+        const clusterId = Zdo.ClusterId.ROUTING_TABLE_REQUEST;
+        const table: RoutingTableEntry[] = [];
+        const request = async (startIndex: number): Promise<[tableEntries: number, entryCount: number]> => {
+            const zdoPayload = Zdo.Buffalo.buildRequest(clusterId, Entity.adapter!.hasZdoMessageOverhead, startIndex);
+            const result = await Entity.adapter!.sendZdo<ZdoTypes.RoutingTableResponse>(
+                this.ieeeAddr,
+                this.networkAddress,
+                clusterId,
+                zdoPayload,
+                false,
+            );
+
+            for (const entry of result.entryList) {
+                table.push({
+                    destinationAddress: entry.destinationAddress,
+                    status: RoutingTableStatus[entry.status], // get str value from enum to satisfy upstream's needs
+                    nextHop: entry.nextHopAddress,
+                });
+            }
+
+            return [result.routingTableEntries, result.entryList.length];
+        };
+
+        let [tableEntries, entryCount] = await request(0);
+
+        const size = tableEntries;
+        let nextStartIndex = entryCount;
+
+        while (table.length < size) {
+            [tableEntries, entryCount] = await request(nextStartIndex);
+
+            nextStartIndex += entryCount;
+        }
+
+        return {table};
     }
 
     public async ping(disableRecovery = true): Promise<void> {

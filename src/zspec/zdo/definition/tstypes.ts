@@ -59,7 +59,7 @@ export type MACCapabilityFlags = {
  * - [networkManager: 1]
  * - [reserved1: 1]
  * - [reserved2: 1]
- * - [stackComplianceResivion: 7]
+ * - [stackComplianceRevision: 7]
  */
 export type ServerMask = {
     primaryTrustCenter: number;
@@ -77,7 +77,7 @@ export type ServerMask = {
      * A stack that is compliant to Revision 23 would set these bits to 23 (0010111b).
      * A stack SHALL indicate the Revision of the specification it is compliant to by setting these bits.
      */
-    stackComplianceResivion: number;
+    stackComplianceRevision: number;
 };
 
 //-------------------------------------------------------------------------------------------------
@@ -261,7 +261,7 @@ export type NodeDescriptorResponse = {
     /** 000 == Zigbee Coordinator, 001 == Zigbee Router,  010 === Zigbee End Device, 011-111 === Reserved */
     logicalType: number;
     /** R23 and above (determined via other means if not). Indicates whether the device supports fragmentation at the APS layer. */
-    fragmentationSupported: boolean | null;
+    fragmentationSupported: boolean | undefined;
     /** Specifies the application support sub-layer capabilities of the node. Currently not supported, should be zero */
     apsFlags: number;
     /**

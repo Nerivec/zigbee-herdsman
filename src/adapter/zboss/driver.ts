@@ -1,5 +1,6 @@
 /* istanbul ignore file */
 
+import assert from 'assert';
 import EventEmitter from 'events';
 
 import equals from 'fast-deep-equal/es6';
@@ -8,6 +9,7 @@ import {TsType} from '..';
 import {KeyValue} from '../../controller/tstype';
 import {Queue, Waitress} from '../../utils';
 import {logger} from '../../utils/logger';
+import * as Zdo from '../../zspec/zdo';
 import {CommandId, DeviceType, PolicyType, ResetOptions, StatusCodeGeneric} from './enums';
 import {FrameType, makeFrame, ZBOSSFrame} from './frame';
 import {ZBOSSUart} from './uart';
@@ -30,6 +32,17 @@ type ZBOSSNetworkInfo = {
         extendedPanID: number[];
         channel: number;
     };
+};
+
+const ZDO_CLUSTER_ID_TO_ZBOSS_CMD_ID: Readonly<Partial<Record<Zdo.ClusterId, number>>> = {
+    [Zdo.ClusterId.PERMIT_JOINING_REQUEST]: CommandId.ZDO_PERMIT_JOINING_REQ,
+    [Zdo.ClusterId.LQI_TABLE_REQUEST]: CommandId.ZDO_MGMT_LQI_REQ,
+    [Zdo.ClusterId.NODE_DESCRIPTOR_REQUEST]: CommandId.ZDO_NODE_DESC_REQ,
+    [Zdo.ClusterId.ACTIVE_ENDPOINTS_REQUEST]: CommandId.ZDO_ACTIVE_EP_REQ,
+    [Zdo.ClusterId.SIMPLE_DESCRIPTOR_REQUEST]: CommandId.ZDO_SIMPLE_DESC_REQ,
+    [Zdo.ClusterId.LEAVE_REQUEST]: CommandId.ZDO_MGMT_LEAVE_REQ,
+    [Zdo.ClusterId.BIND_REQUEST]: CommandId.ZDO_BIND_REQ,
+    [Zdo.ClusterId.UNBIND_REQUEST]: CommandId.ZDO_UNBIND_REQ,
 };
 
 export class ZBOSSDriver extends EventEmitter {
@@ -338,36 +351,12 @@ export class ZBOSSDriver extends EventEmitter {
         };
     }
 
-    public async permitJoin(nwk: number, duration: number): Promise<void> {
-        await this.execCommand(CommandId.ZDO_PERMIT_JOINING_REQ, {nwk: nwk, duration: duration, tcSignificance: 1});
-    }
-
     public async setTXPower(value: number): Promise<void> {
         await this.execCommand(CommandId.SET_TX_POWER, {txPower: value});
     }
 
-    public async lqi(nwk: number, index: number): Promise<ZBOSSFrame> {
-        return this.execCommand(CommandId.ZDO_MGMT_LQI_REQ, {nwk: nwk, startIndex: index});
-    }
-
     public async neighbors(ieee: string): Promise<ZBOSSFrame> {
         return this.execCommand(CommandId.NWK_GET_NEIGHBOR_BY_IEEE, {ieee: ieee});
-    }
-
-    public async nodeDescriptor(nwk: number): Promise<ZBOSSFrame> {
-        return this.execCommand(CommandId.ZDO_NODE_DESC_REQ, {nwk: nwk});
-    }
-
-    public async activeEndpoints(nwk: number): Promise<ZBOSSFrame> {
-        return this.execCommand(CommandId.ZDO_ACTIVE_EP_REQ, {nwk: nwk});
-    }
-
-    public async simpleDescriptor(nwk: number, ep: number): Promise<ZBOSSFrame> {
-        return this.execCommand(CommandId.ZDO_SIMPLE_DESC_REQ, {nwk: nwk, endpoint: ep});
-    }
-
-    public async removeDevice(nwk: number, ieee: string): Promise<ZBOSSFrame> {
-        return this.execCommand(CommandId.ZDO_MGMT_LEAVE_REQ, {nwk: nwk, ieee: ieee, flags: 0});
     }
 
     public async request(ieee: string, profileID: number, clusterID: number, dstEp: number, srcEp: number, data: Buffer): Promise<ZBOSSFrame> {
@@ -390,47 +379,48 @@ export class ZBOSSDriver extends EventEmitter {
         return this.execCommand(CommandId.APSDE_DATA_REQ, payload);
     }
 
-    public async bind(
-        destinationNetworkAddress: number,
-        sourceIeeeAddress: string,
-        sourceEndpoint: number,
-        clusterID: number,
-        destinationAddressOrGroup: string | number,
-        type: 'endpoint' | 'group',
-        destinationEndpoint?: number,
-    ): Promise<ZBOSSFrame> {
-        return this.execCommand(CommandId.ZDO_BIND_REQ, {
-            target: destinationNetworkAddress,
-            srcIeee: sourceIeeeAddress,
-            srcEP: sourceEndpoint,
-            clusterID: clusterID,
-            addrMode: type == 'endpoint' ? 3 /* ieee */ : 1 /* group */,
-            dstIeee: destinationAddressOrGroup,
-            dstEP: destinationEndpoint || 1,
-        });
-    }
-
-    public async unbind(
-        destinationNetworkAddress: number,
-        sourceIeeeAddress: string,
-        sourceEndpoint: number,
-        clusterID: number,
-        destinationAddressOrGroup: string | number,
-        type: 'endpoint' | 'group',
-        destinationEndpoint?: number,
-    ): Promise<ZBOSSFrame> {
-        return this.execCommand(CommandId.ZDO_UNBIND_REQ, {
-            target: destinationNetworkAddress,
-            srcIeee: sourceIeeeAddress,
-            srcEP: sourceEndpoint,
-            clusterID: clusterID,
-            addrMode: type == 'endpoint' ? 3 /* ieee */ : 1 /* group */,
-            dstIeee: destinationAddressOrGroup,
-            dstEP: destinationEndpoint || 1,
-        });
-    }
-
     public async ieeeByNwk(nwk: number): Promise<string> {
         return (await this.execCommand(CommandId.NWK_GET_IEEE_BY_SHORT, {nwk: nwk})).payload.ieee;
+    }
+
+    public async requestZdo(clusterId: Zdo.ClusterId, payload: Buffer, timeout: number = 10000): Promise<ZBOSSFrame> {
+        const commandId = ZDO_CLUSTER_ID_TO_ZBOSS_CMD_ID[clusterId];
+        assert(commandId, `Cluster ID ${clusterId} not supported.`);
+        const commandLog = `${CommandId[commandId]}(${commandId})`;
+
+        logger.debug(() => `==> ${commandLog}: ${payload.toString('hex')}`, NS);
+
+        if (!this.port.portOpen) {
+            throw new Error('Connection not initialized');
+        }
+
+        return this.queue.execute<ZBOSSFrame>(async (): Promise<ZBOSSFrame> => {
+            const buf = Buffer.alloc(5 + payload.length);
+            buf.writeInt8(0, 0);
+            buf.writeInt8(FrameType.REQUEST, 1);
+            buf.writeUInt16LE(commandId, 2);
+            buf.writeUInt8(this.tsn, 4);
+            buf.set(payload, 5);
+
+            // TODO: double-check everything
+            const waiter = this.waitFor(commandId, this.tsn, timeout);
+            this.tsn = (this.tsn + 1) & 255;
+
+            try {
+                logger.debug(() => `==> FRAME: ${commandLog}: ${buf.toString('hex')}`, NS);
+                await this.port.sendBuffer(buf);
+
+                const response = await waiter.start().promise;
+
+                if (response?.payload?.status !== StatusCodeGeneric.OK) {
+                    throw new Error(`Error on command ${commandLog}: ${JSON.stringify(response)}`);
+                }
+
+                return response;
+            } catch (error) {
+                this.waitress.remove(waiter.ID);
+                throw new Error(`Failure send ${commandLog}, ${error}`);
+            }
+        });
     }
 }

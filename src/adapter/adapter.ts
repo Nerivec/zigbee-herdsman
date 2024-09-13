@@ -6,6 +6,7 @@ import * as Models from '../models';
 import {logger} from '../utils/logger';
 import {BroadcastAddress} from '../zspec/enums';
 import * as Zcl from '../zspec/zcl';
+import * as Zdo from '../zspec/zdo';
 import * as AdapterEvents from './events';
 import * as TsType from './tstype';
 
@@ -22,6 +23,7 @@ interface AdapterEventMap {
 
 abstract class Adapter extends events.EventEmitter<AdapterEventMap> {
     public readonly greenPowerGroup = 0x0b84;
+    public hasZdoMessageOverhead: boolean = true;
     protected networkOptions: TsType.NetworkOptions;
     protected adapterOptions: TsType.AdapterOptions;
     protected serialPortOptions: TsType.SerialPortOptions;
@@ -197,8 +199,6 @@ abstract class Adapter extends events.EventEmitter<AdapterEventMap> {
 
     public abstract getNetworkParameters(): Promise<TsType.NetworkParameters>;
 
-    public abstract changeChannel(newChannel: number): Promise<void>;
-
     public abstract setTransmitPower(value: number): Promise<void>;
 
     public abstract addInstallCode(ieeeAddress: string, key: Buffer): Promise<void>;
@@ -220,37 +220,20 @@ abstract class Adapter extends events.EventEmitter<AdapterEventMap> {
 
     public abstract permitJoin(seconds: number, networkAddress?: number): Promise<void>;
 
-    public abstract lqi(networkAddress: number): Promise<TsType.LQI>;
-
-    public abstract routingTable(networkAddress: number): Promise<TsType.RoutingTable>;
-
-    public abstract nodeDescriptor(networkAddress: number): Promise<TsType.NodeDescriptor>;
-
-    public abstract activeEndpoints(networkAddress: number): Promise<TsType.ActiveEndpoints>;
-
-    public abstract simpleDescriptor(networkAddress: number, endpointID: number): Promise<TsType.SimpleDescriptor>;
-
-    public abstract bind(
-        destinationNetworkAddress: number,
-        sourceIeeeAddress: string,
-        sourceEndpoint: number,
-        clusterID: number,
-        destinationAddressOrGroup: string | number,
-        type: 'endpoint' | 'group',
-        destinationEndpoint?: number,
+    public abstract sendZdo(
+        ieeeAddress: string,
+        networkAddress: number,
+        clusterId: Zdo.ClusterId,
+        payload: Buffer,
+        disableResponse: true,
     ): Promise<void>;
-
-    public abstract unbind(
-        destinationNetworkAddress: number,
-        sourceIeeeAddress: string,
-        sourceEndpoint: number,
-        clusterID: number,
-        destinationAddressOrGroup: string | number,
-        type: 'endpoint' | 'group',
-        destinationEndpoint?: number,
-    ): Promise<void>;
-
-    public abstract removeDevice(networkAddress: number, ieeeAddr: string): Promise<void>;
+    public abstract sendZdo<T>(
+        ieeeAddress: string,
+        networkAddress: number,
+        clusterId: Zdo.ClusterId,
+        payload: Buffer,
+        disableResponse: false,
+    ): Promise<T>;
 
     /**
      * ZCL

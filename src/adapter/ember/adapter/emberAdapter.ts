@@ -12,7 +12,6 @@ import * as ZSpec from '../../../zspec';
 import {EUI64, ExtendedPanId, NodeId, PanId} from '../../../zspec/tstypes';
 import * as Zcl from '../../../zspec/zcl';
 import * as Zdo from '../../../zspec/zdo';
-import {BuffaloZdo} from '../../../zspec/zdo/buffaloZdo';
 import * as ZdoTypes from '../../../zspec/zdo/definition/tstypes';
 import {DeviceAnnouncePayload, DeviceJoinedPayload, DeviceLeavePayload, NetworkAddressPayload, ZclPayload} from '../../events';
 import SerialPortUtils from '../../serialPortUtils';
@@ -99,18 +98,6 @@ export type LinkKeyBackupData = {
     incomingFrameCounter: number;
 };
 
-/** Enum to pass strings from numbers up to Z2M. */
-enum RoutingTableStatus {
-    ACTIVE = 0x0,
-    DISCOVERY_UNDERWAY = 0x1,
-    DISCOVERY_FAILED = 0x2,
-    INACTIVE = 0x3,
-    VALIDATION_UNDERWAY = 0x4,
-    RESERVED1 = 0x5,
-    RESERVED2 = 0x6,
-    RESERVED3 = 0x7,
-}
-
 enum NetworkInitAction {
     /** Ain't that nice! */
     DONE,
@@ -141,8 +128,6 @@ const autoDetectDefinitions = [
 const APPLICATION_ZDO_SEQUENCE_MASK = 0x7f;
 /* Default radius used for broadcast ZDO requests. uint8_t */
 const ZDO_REQUEST_RADIUS = 0xff;
-/** Current revision of the spec by zigbee alliance supported by Z2M. */
-const CURRENT_ZIGBEE_SPEC_REVISION = 22;
 /** Oldest supported EZSP version for backups. Don't take the risk to restore a broken network until older backup versions can be investigated. */
 const BACKUP_OLDEST_SUPPORTED_EZSP_VERSION = 12;
 /**
@@ -290,6 +275,7 @@ export class EmberAdapter extends Adapter {
         adapterOptions: TsType.AdapterOptions,
     ) {
         super(networkOptions, serialPortOptions, backupPath, adapterOptions);
+        this.hasZdoMessageOverhead = true;
 
         this.version = {
             ezsp: 0,
@@ -536,7 +522,7 @@ export class EmberAdapter extends Adapter {
      */
     private async onZDOResponse(apsFrame: EmberApsFrame, sender: NodeId, messageContents: Buffer): Promise<void> {
         try {
-            const payload = BuffaloZdo.readResponse(apsFrame.clusterId, messageContents);
+            const payload = Zdo.Buffalo.readResponse(apsFrame.clusterId, messageContents);
 
             logger.debug(() => `<~~~ [ZDO ${Zdo.ClusterId[apsFrame.clusterId]} from=${sender} ${payload ? JSON.stringify(payload) : 'OK'}]`, NS);
             this.oneWaitress.resolveZDO(sender, apsFrame, payload);
@@ -985,16 +971,12 @@ export class EmberAdapter extends Adapter {
                 logger.info(`[INIT TC] Forming from backup.`, NS);
                 // `backup` valid in this `action` path (not detected by TS)
                 /* istanbul ignore next */
-                const keyList: LinkKeyBackupData[] = backup!.devices.map((device) => {
-                    const octets = Array.from(device.ieeeAddress.reverse());
-
-                    return {
-                        deviceEui64: `0x${octets.map((octet) => octet.toString(16).padStart(2, '0')).join('')}`,
-                        key: {contents: device.linkKey!.key},
-                        outgoingFrameCounter: device.linkKey!.txCounter,
-                        incomingFrameCounter: device.linkKey!.rxCounter,
-                    };
-                });
+                const keyList: LinkKeyBackupData[] = backup!.devices.map((device) => ({
+                    deviceEui64: `0x${device.ieeeAddress.reverse().toString('hex')}`,
+                    key: {contents: device.linkKey!.key},
+                    outgoingFrameCounter: device.linkKey!.txCounter,
+                    incomingFrameCounter: device.linkKey!.rxCounter,
+                }));
 
                 // before forming
                 await this.importLinkKeys(keyList);
@@ -1526,43 +1508,6 @@ export class EmberAdapter extends Adapter {
     }
 
     /**
-     * Enable local permit join and optionally broadcast the ZDO Mgmt_Permit_Join_req message.
-     * This API can be called from any device type and still return EMBER_SUCCESS.
-     * If the API is called from an end device, the permit association bit will just be left off.
-     *
-     * @param duration uint8_t The duration that the permit join bit will remain on
-     * and other devices will be able to join the current network.
-     * @param broadcastMgmtPermitJoin whether or not to broadcast the ZDO Mgmt_Permit_Join_req message.
-     *
-     * @returns status of whether or not permit join was enabled.
-     * @returns apsFrame Will be null if not broadcasting.
-     * @returns messageTag The tag passed to ezspSend${x} function.
-     */
-    private async emberPermitJoining(
-        duration: number,
-        broadcastMgmtPermitJoin: boolean,
-    ): Promise<[SLStatus, apsFrame: EmberApsFrame | undefined, messageTag: number | undefined]> {
-        let status = await this.ezsp.ezspPermitJoining(duration);
-        let apsFrame: EmberApsFrame | undefined;
-        let messageTag: number | undefined;
-
-        logger.debug(`Permit joining for ${duration} sec. status=${[status]}`, NS);
-
-        if (broadcastMgmtPermitJoin) {
-            // `authentication`: TC significance always 1 (zb specs)
-            const zdoPayload = BuffaloZdo.buildPermitJoining(duration, 1, []);
-            [status, apsFrame, messageTag] = await this.sendZDORequest(
-                ZSpec.BroadcastAddress.DEFAULT,
-                Zdo.ClusterId.PERMIT_JOINING_REQUEST,
-                zdoPayload,
-                DEFAULT_APS_OPTIONS,
-            );
-        }
-
-        return [status, apsFrame, messageTag];
-    }
-
-    /**
      * Set the trust center policy bitmask using decision.
      * @param decision
      * @returns
@@ -1604,77 +1549,6 @@ export class EmberAdapter extends Adapter {
      */
     private nextZDORequestSequence(): number {
         return (this.zdoRequestSequence = ++this.zdoRequestSequence & APPLICATION_ZDO_SEQUENCE_MASK);
-    }
-
-    /**
-     * ZDO
-     *
-     * @param destination
-     * @param clusterId uint16_t
-     * @param messageContents Content of the ZDO request (sequence to be assigned at index zero)
-     * @param options
-     * @returns status Indicates success or failure (with reason) of send
-     * @returns apsFrame The APS Frame resulting of the request being built and sent (`sequence` set from stack-given value).
-     * @returns messageTag The tag passed to ezspSend${x} function.
-     */
-    private async sendZDORequest(
-        destination: NodeId,
-        clusterId: number,
-        messageContents: Buffer,
-        options: EmberApsOption,
-    ): Promise<[SLStatus, apsFrame: EmberApsFrame, messageTag: number]> {
-        const messageTag = this.nextZDORequestSequence();
-        messageContents[0] = messageTag;
-
-        const apsFrame: EmberApsFrame = {
-            profileId: Zdo.ZDO_PROFILE_ID,
-            clusterId,
-            sourceEndpoint: Zdo.ZDO_ENDPOINT,
-            destinationEndpoint: Zdo.ZDO_ENDPOINT,
-            options,
-            groupId: 0,
-            sequence: 0, // set by stack
-        };
-
-        if (
-            destination === ZSpec.BroadcastAddress.DEFAULT ||
-            destination === ZSpec.BroadcastAddress.RX_ON_WHEN_IDLE ||
-            destination === ZSpec.BroadcastAddress.SLEEPY
-        ) {
-            logger.debug(
-                `~~~> [ZDO ${Zdo.ClusterId[clusterId]} BROADCAST to=${destination} messageTag=${messageTag} messageContents=${messageContents.toString('hex')}]`,
-                NS,
-            );
-            const [status, apsSequence] = await this.ezsp.ezspSendBroadcast(
-                ZSpec.NULL_NODE_ID, // alias
-                destination,
-                0, // nwkSequence
-                apsFrame,
-                ZDO_REQUEST_RADIUS,
-                messageTag,
-                messageContents,
-            );
-            apsFrame.sequence = apsSequence;
-
-            logger.debug(`~~~> [SENT ZDO type=BROADCAST apsSequence=${apsSequence} messageTag=${messageTag} status=${SLStatus[status]}`, NS);
-            return [status, apsFrame, messageTag];
-        } else {
-            logger.debug(
-                `~~~> [ZDO ${Zdo.ClusterId[clusterId]} UNICAST to=${destination} messageTag=${messageTag} messageContents=${messageContents.toString('hex')}]`,
-                NS,
-            );
-            const [status, apsSequence] = await this.ezsp.ezspSendUnicast(
-                EmberOutgoingMessageType.DIRECT,
-                destination,
-                apsFrame,
-                messageTag,
-                messageContents,
-            );
-            apsFrame.sequence = apsSequence;
-
-            logger.debug(`~~~> [SENT ZDO type=DIRECT apsSequence=${apsSequence} messageTag=${messageTag} status=${SLStatus[status]}`, NS);
-            return [status, apsFrame, messageTag];
-        }
     }
 
     //---- END Ember ZDO
@@ -1862,31 +1736,6 @@ export class EmberAdapter extends Adapter {
     }
 
     // queued
-    public async changeChannel(newChannel: number): Promise<void> {
-        return this.queue.execute<void>(async () => {
-            this.checkInterpanLock();
-
-            const zdoPayload = BuffaloZdo.buildChannelChangeRequest(newChannel, null);
-            const [status] = await this.sendZDORequest(
-                ZSpec.BroadcastAddress.SLEEPY,
-                Zdo.ClusterId.NWK_UPDATE_REQUEST,
-                zdoPayload,
-                DEFAULT_APS_OPTIONS,
-            );
-
-            if (status !== SLStatus.OK) {
-                throw new Error(`[ZDO] Failed broadcast channel change to '${newChannel}' with status=${SLStatus[status]}.`);
-            }
-
-            await this.oneWaitress.startWaitingForEvent(
-                {eventName: OneWaitressEvents.STACK_STATUS_CHANNEL_CHANGED},
-                DEFAULT_NETWORK_REQUEST_TIMEOUT * 2, // observed to ~9sec
-                '[ZDO] Change Channel',
-            );
-        });
-    }
-
-    // queued
     public async setTransmitPower(value: number): Promise<void> {
         return this.queue.execute<void>(async () => {
             const status = await this.ezsp.ezspSetRadioPower(value);
@@ -2024,26 +1873,9 @@ export class EmberAdapter extends Adapter {
                 await preJoining();
 
                 // `authentication`: TC significance always 1 (zb specs)
-                const zdoPayload = BuffaloZdo.buildPermitJoining(seconds, 1, []);
-                const [status, apsFrame] = await this.sendZDORequest(
-                    networkAddress,
-                    Zdo.ClusterId.PERMIT_JOINING_REQUEST,
-                    zdoPayload,
-                    DEFAULT_APS_OPTIONS, // XXX: SDK has 0 here?
-                );
+                const zdoPayload = Zdo.Buffalo.buildRequest(Zdo.ClusterId.PERMIT_JOINING_REQUEST, this.hasZdoMessageOverhead, seconds, 1, []);
 
-                if (status !== SLStatus.OK) {
-                    throw new Error(`[ZDO] Failed permit joining request for '${networkAddress}' with status=${SLStatus[status]}.`);
-                }
-
-                await this.oneWaitress.startWaitingFor<void>(
-                    {
-                        target: networkAddress,
-                        apsFrame,
-                        responseClusterId: Zdo.ClusterId.PERMIT_JOINING_RESPONSE,
-                    },
-                    DEFAULT_REQUEST_TIMEOUT,
-                );
+                await this.sendZdo(ZSpec.BLANK_EUI64, networkAddress, Zdo.ClusterId.PERMIT_JOINING_REQUEST, zdoPayload, false);
             });
         } else {
             // coordinator-only, or all
@@ -2051,382 +1883,19 @@ export class EmberAdapter extends Adapter {
                 this.checkInterpanLock();
                 await preJoining();
 
-                // local permit join if `Coordinator`-only requested, else local + broadcast
-                const [status] = await this.emberPermitJoining(seconds, networkAddress === ZSpec.COORDINATOR_ADDRESS ? false : true);
+                const status = await this.ezsp.ezspPermitJoining(seconds);
 
-                if (status !== SLStatus.OK) {
-                    throw new Error(`[ZDO] Failed permit joining request with status=${SLStatus[status]}.`);
+                logger.debug(`Permit joining on coordinator for ${seconds} sec. status=${[status]}`, NS);
+
+                // broadcast permit joining ZDO
+                if (networkAddress === undefined) {
+                    // `authentication`: TC significance always 1 (zb specs)
+                    const zdoPayload = Zdo.Buffalo.buildRequest(Zdo.ClusterId.PERMIT_JOINING_REQUEST, this.hasZdoMessageOverhead, seconds, 1, []);
+
+                    await this.sendZdo(ZSpec.BLANK_EUI64, ZSpec.BroadcastAddress.DEFAULT, Zdo.ClusterId.PERMIT_JOINING_REQUEST, zdoPayload, true);
                 }
-
-                // NOTE: because Z2M is refreshing the permit join duration early to prevent it from closing
-                //       (every 200sec, even if only opened for 254sec), we can't wait for the stack opened status,
-                //       as it won't trigger again if already opened... so instead we assume it worked
-                // NOTE2: with EZSP, 255=forever, and 254=max, but since upstream logic uses fixed 254 with interval refresh,
-                //        we can't simply bypass upstream calls if called for "forever" to prevent useless NCP calls (3-4 each time),
-                //        until called with 0 (disable), since we don't know if it was requested for forever or not...
-                // TLDR: upstream logic change required to allow this
-                // if (seconds) {
-                //     await this.oneWaitress.startWaitingForEvent(
-                //         {eventName: OneWaitressEvents.STACK_STATUS_NETWORK_OPENED},
-                //         DEFAULT_ZCL_REQUEST_TIMEOUT,
-                //         '[ZDO] Permit Joining',
-                //     );
-                // } else {
-                //     // NOTE: CLOSED stack status is not triggered if the network was not OPENED in the first place, so don't wait for it
-                //     //       same kind of problem as described above (upstream always tries to close after start, but EZSP already is)
-                // }
             });
         }
-    }
-
-    // queued, non-InterPAN
-    public async lqi(networkAddress: number): Promise<TsType.LQI> {
-        return this.queue.execute<TsType.LQI>(async () => {
-            this.checkInterpanLock();
-
-            const neighbors: TsType.LQINeighbor[] = [];
-            const request = async (startIndex: number): Promise<[tableEntries: number, entryCount: number]> => {
-                const zdoPayload = BuffaloZdo.buildLqiTableRequest(startIndex);
-                const [status, apsFrame] = await this.sendZDORequest(
-                    networkAddress,
-                    Zdo.ClusterId.LQI_TABLE_REQUEST,
-                    zdoPayload,
-                    DEFAULT_APS_OPTIONS,
-                );
-
-                if (status !== SLStatus.OK) {
-                    throw new Error(`[ZDO] Failed LQI request for '${networkAddress}' (index '${startIndex}') with status=${SLStatus[status]}.`);
-                }
-
-                const result = await this.oneWaitress.startWaitingFor<ZdoTypes.LQITableResponse>(
-                    {
-                        target: networkAddress,
-                        apsFrame,
-                        responseClusterId: Zdo.ClusterId.LQI_TABLE_RESPONSE,
-                    },
-                    DEFAULT_REQUEST_TIMEOUT,
-                );
-
-                for (const entry of result.entryList) {
-                    neighbors.push({
-                        ieeeAddr: entry.eui64,
-                        networkAddress: entry.nwkAddress,
-                        linkquality: entry.lqi,
-                        relationship: entry.relationship,
-                        depth: entry.depth,
-                    });
-                }
-
-                return [result.neighborTableEntries, result.entryList.length];
-            };
-
-            let [tableEntries, entryCount] = await request(0);
-
-            const size = tableEntries;
-            let nextStartIndex = entryCount;
-
-            while (neighbors.length < size) {
-                [tableEntries, entryCount] = await request(nextStartIndex);
-
-                nextStartIndex += entryCount;
-            }
-
-            return {neighbors};
-        }, networkAddress);
-    }
-
-    // queued, non-InterPAN
-    public async routingTable(networkAddress: number): Promise<TsType.RoutingTable> {
-        return this.queue.execute<TsType.RoutingTable>(async () => {
-            this.checkInterpanLock();
-
-            const table: TsType.RoutingTableEntry[] = [];
-            const request = async (startIndex: number): Promise<[tableEntries: number, entryCount: number]> => {
-                const zdoPayload = BuffaloZdo.buildRoutingTableRequest(startIndex);
-                const [status, apsFrame] = await this.sendZDORequest(
-                    networkAddress,
-                    Zdo.ClusterId.ROUTING_TABLE_REQUEST,
-                    zdoPayload,
-                    DEFAULT_APS_OPTIONS,
-                );
-
-                if (status !== SLStatus.OK) {
-                    throw new Error(
-                        `[ZDO] Failed routing table request for '${networkAddress}' (index '${startIndex}') with status=${SLStatus[status]}.`,
-                    );
-                }
-
-                const result = await this.oneWaitress.startWaitingFor<ZdoTypes.RoutingTableResponse>(
-                    {
-                        target: networkAddress,
-                        apsFrame,
-                        responseClusterId: Zdo.ClusterId.ROUTING_TABLE_RESPONSE,
-                    },
-                    DEFAULT_REQUEST_TIMEOUT,
-                );
-
-                for (const entry of result.entryList) {
-                    table.push({
-                        destinationAddress: entry.destinationAddress,
-                        status: RoutingTableStatus[entry.status], // get str value from enum to satisfy upstream's needs
-                        nextHop: entry.nextHopAddress,
-                    });
-                }
-
-                return [result.routingTableEntries, result.entryList.length];
-            };
-
-            let [tableEntries, entryCount] = await request(0);
-
-            const size = tableEntries;
-            let nextStartIndex = entryCount;
-
-            while (table.length < size) {
-                [tableEntries, entryCount] = await request(nextStartIndex);
-
-                nextStartIndex += entryCount;
-            }
-
-            return {table};
-        }, networkAddress);
-    }
-
-    // queued, non-InterPAN
-    public async nodeDescriptor(networkAddress: number): Promise<TsType.NodeDescriptor> {
-        return this.queue.execute<TsType.NodeDescriptor>(async () => {
-            this.checkInterpanLock();
-
-            const zdoPayload = BuffaloZdo.buildNodeDescriptorRequest(networkAddress);
-            const [status, apsFrame] = await this.sendZDORequest(
-                networkAddress,
-                Zdo.ClusterId.NODE_DESCRIPTOR_REQUEST,
-                zdoPayload,
-                DEFAULT_APS_OPTIONS,
-            );
-
-            if (status !== SLStatus.OK) {
-                throw new Error(`[ZDO] Failed node descriptor request for '${networkAddress}' with status=${SLStatus[status]}.`);
-            }
-
-            const result = await this.oneWaitress.startWaitingFor<ZdoTypes.NodeDescriptorResponse>(
-                {
-                    target: networkAddress,
-                    apsFrame,
-                    responseClusterId: Zdo.ClusterId.NODE_DESCRIPTOR_RESPONSE,
-                },
-                DEFAULT_REQUEST_TIMEOUT,
-            );
-
-            let type: TsType.DeviceType = 'Unknown';
-
-            switch (result.logicalType) {
-                case 0x0:
-                    type = 'Coordinator';
-                    break;
-                case 0x1:
-                    type = 'Router';
-                    break;
-                case 0x2:
-                    type = 'EndDevice';
-                    break;
-            }
-
-            /* istanbul ignore else */
-            if (result.serverMask.stackComplianceResivion < CURRENT_ZIGBEE_SPEC_REVISION) {
-                // always 0 before rev. 21 where field was added
-                const rev = result.serverMask.stackComplianceResivion < 21 ? 'pre-21' : result.serverMask.stackComplianceResivion;
-
-                logger.warning(
-                    `[ZDO] Device '${networkAddress}' is only compliant to revision '${rev}' of the ZigBee specification (current revision: ${CURRENT_ZIGBEE_SPEC_REVISION}).`,
-                    NS,
-                );
-            }
-
-            return {type, manufacturerCode: result.manufacturerCode};
-        }, networkAddress);
-    }
-
-    // queued, non-InterPAN
-    public async activeEndpoints(networkAddress: number): Promise<TsType.ActiveEndpoints> {
-        return this.queue.execute<TsType.ActiveEndpoints>(async () => {
-            this.checkInterpanLock();
-
-            const zdoPayload = BuffaloZdo.buildActiveEndpointsRequest(networkAddress);
-            const [status, apsFrame] = await this.sendZDORequest(
-                networkAddress,
-                Zdo.ClusterId.ACTIVE_ENDPOINTS_REQUEST,
-                zdoPayload,
-                DEFAULT_APS_OPTIONS,
-            );
-
-            if (status !== SLStatus.OK) {
-                throw new Error(`[ZDO] Failed active endpoints request for '${networkAddress}' with status=${SLStatus[status]}.`);
-            }
-
-            const result = await this.oneWaitress.startWaitingFor<ZdoTypes.ActiveEndpointsResponse>(
-                {
-                    target: networkAddress,
-                    apsFrame,
-                    responseClusterId: Zdo.ClusterId.ACTIVE_ENDPOINTS_RESPONSE,
-                },
-                DEFAULT_REQUEST_TIMEOUT,
-            );
-
-            return {endpoints: result.endpointList};
-        }, networkAddress);
-    }
-
-    // queued, non-InterPAN
-    public async simpleDescriptor(networkAddress: number, endpointID: number): Promise<TsType.SimpleDescriptor> {
-        return this.queue.execute<TsType.SimpleDescriptor>(async () => {
-            this.checkInterpanLock();
-
-            const zdoPayload = BuffaloZdo.buildSimpleDescriptorRequest(networkAddress, endpointID);
-            const [status, apsFrame] = await this.sendZDORequest(
-                networkAddress,
-                Zdo.ClusterId.SIMPLE_DESCRIPTOR_REQUEST,
-                zdoPayload,
-                DEFAULT_APS_OPTIONS,
-            );
-
-            if (status !== SLStatus.OK) {
-                throw new Error(
-                    `[ZDO] Failed simple descriptor request for '${networkAddress}' endpoint '${endpointID}' with status=${SLStatus[status]}.`,
-                );
-            }
-
-            const result = await this.oneWaitress.startWaitingFor<ZdoTypes.SimpleDescriptorResponse>(
-                {
-                    target: networkAddress,
-                    apsFrame,
-                    responseClusterId: Zdo.ClusterId.SIMPLE_DESCRIPTOR_RESPONSE,
-                },
-                DEFAULT_REQUEST_TIMEOUT,
-            );
-
-            return {
-                profileID: result.profileId,
-                endpointID: result.endpoint,
-                deviceID: result.deviceId,
-                inputClusters: result.inClusterList,
-                outputClusters: result.outClusterList,
-            };
-        }, networkAddress);
-    }
-
-    // queued, non-InterPAN
-    public async bind(
-        destinationNetworkAddress: number,
-        sourceIeeeAddress: string,
-        sourceEndpoint: number,
-        clusterID: number,
-        destinationAddressOrGroup: string | number,
-        type: 'endpoint' | 'group',
-        destinationEndpoint?: number,
-    ): Promise<void> {
-        return this.queue.execute<void>(async () => {
-            this.checkInterpanLock();
-
-            const zdoPayload = BuffaloZdo.buildBindRequest(
-                sourceIeeeAddress as EUI64,
-                sourceEndpoint,
-                clusterID,
-                type === 'group' ? Zdo.MULTICAST_BINDING : Zdo.UNICAST_BINDING,
-                destinationAddressOrGroup as EUI64, // not used with MULTICAST_BINDING
-                destinationAddressOrGroup as number, // not used with UNICAST_BINDING
-                destinationEndpoint ?? 0, // not used with MULTICAST_BINDING
-            );
-            const [status, apsFrame] = await this.sendZDORequest(
-                destinationNetworkAddress,
-                Zdo.ClusterId.BIND_REQUEST,
-                zdoPayload,
-                DEFAULT_APS_OPTIONS,
-            );
-
-            if (status !== SLStatus.OK) {
-                throw new Error(
-                    `[ZDO] Failed bind request for '${destinationNetworkAddress}' destination '${destinationAddressOrGroup}' endpoint '${destinationEndpoint}' with status=${SLStatus[status]}.`,
-                );
-            }
-
-            await this.oneWaitress.startWaitingFor<void>(
-                {
-                    target: destinationNetworkAddress,
-                    apsFrame,
-                    responseClusterId: Zdo.ClusterId.BIND_RESPONSE,
-                },
-                DEFAULT_REQUEST_TIMEOUT,
-            );
-        }, destinationNetworkAddress);
-    }
-
-    // queued, non-InterPAN
-    public async unbind(
-        destinationNetworkAddress: number,
-        sourceIeeeAddress: string,
-        sourceEndpoint: number,
-        clusterID: number,
-        destinationAddressOrGroup: string | number,
-        type: 'endpoint' | 'group',
-        destinationEndpoint?: number,
-    ): Promise<void> {
-        return this.queue.execute<void>(async () => {
-            this.checkInterpanLock();
-
-            const zdoPayload = BuffaloZdo.buildUnbindRequest(
-                sourceIeeeAddress as EUI64,
-                sourceEndpoint,
-                clusterID,
-                type === 'group' ? Zdo.MULTICAST_BINDING : Zdo.UNICAST_BINDING,
-                destinationAddressOrGroup as EUI64, // not used with MULTICAST_BINDING
-                destinationAddressOrGroup as number, // not used with UNICAST_BINDING
-                destinationEndpoint ?? 0, // not used with MULTICAST_BINDING
-            );
-            const [status, apsFrame] = await this.sendZDORequest(
-                destinationNetworkAddress,
-                Zdo.ClusterId.UNBIND_REQUEST,
-                zdoPayload,
-                DEFAULT_APS_OPTIONS,
-            );
-
-            if (status !== SLStatus.OK) {
-                throw new Error(
-                    `[ZDO] Failed unbind request for '${destinationNetworkAddress}' destination '${destinationAddressOrGroup}' endpoint '${destinationEndpoint}' with status=${SLStatus[status]}.`,
-                );
-            }
-
-            await this.oneWaitress.startWaitingFor<void>(
-                {
-                    target: destinationNetworkAddress,
-                    apsFrame,
-                    responseClusterId: Zdo.ClusterId.UNBIND_RESPONSE,
-                },
-                DEFAULT_REQUEST_TIMEOUT,
-            );
-        }, destinationNetworkAddress);
-    }
-
-    // queued, non-InterPAN
-    public async removeDevice(networkAddress: number, ieeeAddr: string): Promise<void> {
-        return this.queue.execute<void>(async () => {
-            this.checkInterpanLock();
-
-            const zdoPayload = BuffaloZdo.buildLeaveRequest(ieeeAddr as EUI64, Zdo.LeaveRequestFlags.WITHOUT_REJOIN);
-            const [status, apsFrame] = await this.sendZDORequest(networkAddress, Zdo.ClusterId.LEAVE_REQUEST, zdoPayload, DEFAULT_APS_OPTIONS);
-
-            if (status !== SLStatus.OK) {
-                throw new Error(`[ZDO] Failed remove device request for '${networkAddress}' target '${ieeeAddr}' with status=${SLStatus[status]}.`);
-            }
-
-            await this.oneWaitress.startWaitingFor<void>(
-                {
-                    target: networkAddress,
-                    apsFrame,
-                    responseClusterId: Zdo.ClusterId.LEAVE_RESPONSE,
-                },
-                DEFAULT_REQUEST_TIMEOUT,
-            );
-        }, networkAddress);
     }
 
     //---- ZCL
@@ -2615,6 +2084,109 @@ export class EmberAdapter extends Adapter {
             // NOTE: since ezspMessageSentHandler could take a while here, we don't block, it'll just be logged if the delivery failed
             await Wait(QUEUE_BUSY_DEFER_MSEC);
         });
+    }
+
+    //---- ZDO
+
+    // queued, non-InterPAN
+    public async sendZdo(
+        ieeeAddress: string,
+        networkAddress: number,
+        clusterId: Zdo.ClusterId,
+        payload: Buffer,
+        disableResponse: boolean,
+    ): Promise<void>;
+    public async sendZdo<T>(
+        ieeeAddress: string,
+        networkAddress: number,
+        clusterId: Zdo.ClusterId,
+        payload: Buffer,
+        disableResponse: boolean,
+    ): Promise<T>;
+    public async sendZdo<T>(
+        ieeeAddress: string,
+        networkAddress: number,
+        clusterId: Zdo.ClusterId,
+        payload: Buffer,
+        disableResponse: boolean,
+    ): Promise<T | void> {
+        return this.queue.execute<T | void>(async () => {
+            this.checkInterpanLock();
+
+            const clusterName = Zdo.ClusterId[clusterId];
+            const messageTag = this.nextZDORequestSequence();
+            payload[0] = messageTag;
+            const apsFrame: EmberApsFrame = {
+                profileId: Zdo.ZDO_PROFILE_ID,
+                clusterId,
+                sourceEndpoint: Zdo.ZDO_ENDPOINT,
+                destinationEndpoint: Zdo.ZDO_ENDPOINT,
+                options: DEFAULT_APS_OPTIONS,
+                groupId: 0,
+                sequence: 0, // set by stack
+            };
+            let status: SLStatus | undefined;
+            let apsSequence: number | undefined;
+
+            if (
+                networkAddress === ZSpec.BroadcastAddress.DEFAULT ||
+                networkAddress === ZSpec.BroadcastAddress.RX_ON_WHEN_IDLE ||
+                networkAddress === ZSpec.BroadcastAddress.SLEEPY
+            ) {
+                logger.debug(
+                    `~~~> [ZDO ${clusterName} BROADCAST to=${networkAddress} messageTag=${messageTag} payload=${payload.toString('hex')}]`,
+                    NS,
+                );
+
+                [status, apsSequence] = await this.ezsp.ezspSendBroadcast(
+                    ZSpec.NULL_NODE_ID, // alias
+                    networkAddress,
+                    0, // nwkSequence
+                    apsFrame,
+                    ZDO_REQUEST_RADIUS,
+                    messageTag,
+                    payload,
+                );
+                apsFrame.sequence = apsSequence;
+
+                logger.debug(`~~~> [SENT ZDO type=BROADCAST apsSequence=${apsSequence} messageTag=${messageTag} status=${SLStatus[status]}]`, NS);
+            } else {
+                logger.debug(
+                    `~~~> [ZDO ${clusterName} UNICAST to=${networkAddress} messageTag=${messageTag} payload=${payload.toString('hex')}]`,
+                    NS,
+                );
+
+                [status, apsSequence] = await this.ezsp.ezspSendUnicast(
+                    EmberOutgoingMessageType.DIRECT,
+                    networkAddress,
+                    apsFrame,
+                    messageTag,
+                    payload,
+                );
+                apsFrame.sequence = apsSequence;
+
+                logger.debug(`~~~> [SENT ZDO type=DIRECT apsSequence=${apsSequence} messageTag=${messageTag} status=${SLStatus[status]}]`, NS);
+            }
+
+            if (status !== SLStatus.OK) {
+                throw new Error(`~x~> Failed ${clusterName} request for '${ieeeAddress}/${networkAddress}' with status=${SLStatus[status]}.`);
+            }
+
+            if (!disableResponse) {
+                const responseClusterId = Zdo.Utils.getResponseClusterId(clusterId);
+
+                if (responseClusterId) {
+                    return this.oneWaitress.startWaitingFor<T>(
+                        {
+                            target: networkAddress,
+                            apsFrame,
+                            responseClusterId,
+                        },
+                        DEFAULT_REQUEST_TIMEOUT,
+                    );
+                }
+            }
+        }, ieeeAddress);
     }
 
     //---- InterPAN for Touchlink

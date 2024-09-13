@@ -7,6 +7,7 @@ import equals from 'fast-deep-equal/es6';
 import {Wait, Waitress} from '../../../utils';
 import {logger} from '../../../utils/logger';
 import {Clusters} from '../../../zspec/zcl/definition/cluster';
+import * as Zdo from '../../../zspec/zdo';
 import {EZSPAdapterBackup} from '../adapter/backup';
 import * as TsType from './../../tstype';
 import {ParamsDesc} from './commands';
@@ -723,6 +724,38 @@ export class Driver extends EventEmitter {
         const frame = new EmberIeeeRawFrame();
         frame.sequence = this.nextTransactionID();
         return frame;
+    }
+
+    public async requestZdo(
+        networkAddress: number,
+        clusterId: Zdo.ClusterId,
+        payload: Buffer,
+        disableResponse: boolean,
+    ): Promise<EZSPZDOResponseFrameData | void> {
+        const frame = this.makeApsFrame(clusterId, disableResponse);
+
+        const res = await this.request(networkAddress, frame, payload);
+
+        if (!res) {
+            throw Error('zdoRequest>request error');
+        }
+
+        if (!disableResponse) {
+            const responseClusterId = Zdo.Utils.getResponseClusterId(clusterId);
+
+            if (responseClusterId) {
+                const responseClusterName = Zdo.ClusterId[responseClusterId];
+                const response = await this.waitFor(networkAddress, responseClusterId, frame.sequence).start().promise;
+
+                logger.debug(() => `${responseClusterName} frame: ${JSON.stringify(response.payload)}`, NS);
+
+                const result = new EZSPZDOResponseFrameData(responseClusterId, response.payload);
+
+                logger.debug(`${responseClusterName} parsed: ${JSON.stringify(result)}`, NS);
+
+                return result;
+            }
+        }
     }
 
     public async zdoRequest(

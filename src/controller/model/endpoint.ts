@@ -3,8 +3,10 @@ import assert from 'assert';
 import {Events as AdapterEvents} from '../../adapter';
 import {logger} from '../../utils/logger';
 import {BroadcastAddress} from '../../zspec/enums';
+import {EUI64} from '../../zspec/tstypes';
 import * as Zcl from '../../zspec/zcl';
 import * as ZclTypes from '../../zspec/zcl/definition/tstype';
+import * as Zdo from '../../zspec/zdo';
 import Request from '../helpers/request';
 import RequestQueue from '../helpers/requestQueue';
 import * as ZclFrameConverter from '../helpers/zclFrameConverter';
@@ -516,7 +518,6 @@ class Endpoint extends Entity {
 
     public async bind(clusterKey: number | string, target: Endpoint | Group | number): Promise<void> {
         const cluster = this.getCluster(clusterKey);
-        const type = target instanceof Endpoint ? 'endpoint' : 'group';
 
         if (typeof target === 'number') {
             target = Group.byGroupID(target) || Group.create(target);
@@ -528,15 +529,20 @@ class Endpoint extends Entity {
         logger.debug(log, NS);
 
         try {
-            await Entity.adapter!.bind(
-                this.deviceNetworkAddress,
-                this.deviceIeeeAddress,
+            const clusterId = Zdo.ClusterId.BIND_REQUEST;
+            const zdoPayload = Zdo.Buffalo.buildRequest(
+                clusterId,
+                Entity.adapter!.hasZdoMessageOverhead,
+                this.deviceIeeeAddress as EUI64,
                 this.ID,
                 cluster.ID,
-                destinationAddress,
-                type,
-                target instanceof Endpoint ? target.ID : undefined,
+                target instanceof Endpoint ? Zdo.UNICAST_BINDING : Zdo.MULTICAST_BINDING,
+                destinationAddress as EUI64,
+                destinationAddress as number,
+                target instanceof Endpoint ? target.ID : 0xff,
             );
+
+            await Entity.adapter!.sendZdo(this.deviceIeeeAddress, this.deviceNetworkAddress, clusterId, zdoPayload, false);
 
             this.addBindingInternal(cluster, target);
         } catch (error) {
@@ -565,7 +571,6 @@ class Endpoint extends Entity {
             target = groupTarget;
         }
 
-        const type = target instanceof Endpoint ? 'endpoint' : 'group';
         const destinationAddress = target instanceof Endpoint ? target.deviceIeeeAddress : target.groupID;
         const log = `${action} from '${target instanceof Endpoint ? `${destinationAddress}/${target.ID}` : destinationAddress}'`;
         const index = this.getBindIndex(cluster.ID, target);
@@ -578,15 +583,20 @@ class Endpoint extends Entity {
         logger.debug(log, NS);
 
         try {
-            await Entity.adapter!.unbind(
-                this.deviceNetworkAddress,
-                this.deviceIeeeAddress,
+            const clusterId = Zdo.ClusterId.UNBIND_REQUEST;
+            const zdoPayload = Zdo.Buffalo.buildRequest(
+                clusterId,
+                Entity.adapter!.hasZdoMessageOverhead,
+                this.deviceIeeeAddress as EUI64,
                 this.ID,
                 cluster.ID,
-                destinationAddress,
-                type,
-                target instanceof Endpoint ? target.ID : undefined,
+                target instanceof Endpoint ? Zdo.UNICAST_BINDING : Zdo.MULTICAST_BINDING,
+                destinationAddress as EUI64,
+                destinationAddress as number,
+                target instanceof Endpoint ? target.ID : 0xff,
             );
+
+            await Entity.adapter!.sendZdo(this.deviceIeeeAddress, this.deviceNetworkAddress, clusterId, zdoPayload, false);
 
             this._binds.splice(index, 1);
             this.save();

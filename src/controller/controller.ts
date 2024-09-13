@@ -5,11 +5,14 @@ import fs from 'fs';
 import mixinDeep from 'mixin-deep';
 
 import {Adapter, Events as AdapterEvents, TsType as AdapterTsType} from '../adapter';
-import {BackupUtils} from '../utils';
+import {BackupUtils, Wait} from '../utils';
 import {logger} from '../utils/logger';
 import {isNumberArrayOfLength} from '../utils/utils';
+import * as ZSpec from '../zspec';
+import {EUI64} from '../zspec/tstypes';
 import * as Zcl from '../zspec/zcl';
 import {FrameControl} from '../zspec/zcl/definition/tstype';
+import * as Zdo from '../zspec/zdo';
 import Database from './database';
 import * as Events from './events';
 import GreenPower from './greenPower';
@@ -495,10 +498,17 @@ class Controller extends events.EventEmitter<ControllerEventMap> {
      */
     private async changeChannel(oldChannel: number, newChannel: number): Promise<void> {
         logger.warning(`Changing channel from '${oldChannel}' to '${newChannel}'`, NS);
-        await this.adapter.changeChannel(newChannel);
+        const clusterId = Zdo.ClusterId.NWK_UPDATE_REQUEST;
+        const zdoPayload = Zdo.Buffalo.buildRequest(clusterId, this.adapter.hasZdoMessageOverhead, [newChannel], 0xfe, undefined, 0, undefined);
+
+        await this.adapter.sendZdo(ZSpec.BLANK_EUI64, ZSpec.BroadcastAddress.SLEEPY, clusterId, zdoPayload, true);
         logger.info(`Channel changed to '${newChannel}'`, NS);
 
         this.networkParametersCached = undefined; // invalidate cache
+
+        // wait for the broadcast to propagate and the adapter to actually change
+        // emberznet: observed at ~9sec
+        await Wait(12000);
     }
 
     /**
@@ -622,7 +632,21 @@ class Controller extends events.EventEmitter<ControllerEventMap> {
         if (this.options.acceptJoiningDeviceHandler) {
             if (!(await this.options.acceptJoiningDeviceHandler(payload.ieeeAddr))) {
                 logger.debug(`Device '${payload.ieeeAddr}' rejected by handler, removing it`, NS);
-                await catcho(() => this.adapter.removeDevice(payload.networkAddress, payload.ieeeAddr), 'Failed to remove rejected device');
+
+                try {
+                    const clusterId = Zdo.ClusterId.LEAVE_REQUEST;
+                    const zdoPayload = Zdo.Buffalo.buildRequest(
+                        clusterId,
+                        this.adapter.hasZdoMessageOverhead,
+                        payload.ieeeAddr as EUI64,
+                        Zdo.LeaveRequestFlags.WITHOUT_REJOIN,
+                    );
+
+                    await this.adapter.sendZdo(payload.ieeeAddr, payload.networkAddress, clusterId, zdoPayload, false);
+                } catch (error) {
+                    logger.error(`Failed to remove rejected device '${payload.ieeeAddr}', ${(error as Error).message}.`, NS);
+                }
+
                 return;
             } else {
                 logger.debug(`Device '${payload.ieeeAddr}' accepted by handler`, NS);

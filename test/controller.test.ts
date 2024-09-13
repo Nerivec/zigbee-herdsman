@@ -19,8 +19,9 @@ import * as Models from '../src/models';
 import {Wait} from '../src/utils';
 import * as Utils from '../src/utils';
 import {setLogger} from '../src/utils/logger';
-import {BroadcastAddress} from '../src/zspec/enums';
+import * as ZSpec from '../src/zspec';
 import * as Zcl from '../src/zspec/zcl';
+import * as Zdo from '../src/zspec/zdo';
 
 const globalSetImmediate = setImmediate;
 const flushPromises = () => new Promise(globalSetImmediate);
@@ -109,6 +110,11 @@ const mockAdapterGetNetworkParameters = jest.fn().mockReturnValue({panID: 1, ext
 const mockAdapterBind = jest.fn();
 const mocksendZclFrameToGroup = jest.fn();
 const mocksendZclFrameToAll = jest.fn();
+const mockAdapterSendZdo = jest
+    .fn()
+    .mockImplementation(
+        async (ieeeAddress: string, networkAddress: number, clusterId: Zdo.ClusterId, payload: Buffer, disableResponse: boolean) => {},
+    );
 const mockAddInstallCode = jest.fn();
 const mockAdapterUnbind = jest.fn();
 const mockAdapterRemoveDevice = jest.fn();
@@ -244,6 +250,7 @@ const mocksClear = [
     mockAddInstallCode,
     mockAdapterGetNetworkParameters,
     mockAdapterChangeChannel,
+    mockAdapterSendZdo,
     mockLogger.debug,
     mockLogger.info,
     mockLogger.warning,
@@ -577,6 +584,7 @@ jest.mock('../src/adapter/z-stack/adapter/zStackAdapter', () => {
             sendZclFrameToEndpoint: mocksendZclFrameToEndpoint,
             sendZclFrameToGroup: mocksendZclFrameToGroup,
             sendZclFrameToAll: mocksendZclFrameToAll,
+            sendZdo: mockAdapterSendZdo,
             addInstallCode: mockAddInstallCode,
             permitJoin: mockAdapterPermitJoin,
             supportsDiscoverRoute: mockAdapterSupportsDiscoverRoute,
@@ -1802,7 +1810,14 @@ describe('Controller', () => {
     it('Change channel', async () => {
         await controller.start();
         await controller.changeChannel(10, 20);
-        expect(mockAdapterChangeChannel).toHaveBeenCalledWith(20);
+        const zdoPayload = Zdo.Buffalo.buildRequest(Zdo.ClusterId.NWK_UPDATE_REQUEST, false, [20], 0xfe, undefined, 0, undefined);
+        expect(mockAdapterSendZdo).toHaveBeenCalledWith(
+            ZSpec.BLANK_EUI64,
+            ZSpec.BroadcastAddress.SLEEPY,
+            Zdo.ClusterId.NWK_UPDATE_REQUEST,
+            zdoPayload,
+            true,
+        );
         mockAdapterGetNetworkParameters.mockReturnValueOnce({panID: 1, extendedPanID: 3, channel: 20});
         expect(await controller.getNetworkParameters()).toEqual({panID: 1, channel: 20, extendedPanID: 3});
     });
@@ -1812,7 +1827,14 @@ describe('Controller', () => {
         mockAdapterGetNetworkParameters.mockReturnValueOnce({panID: 1, extendedPanID: 3, channel: 25});
         await controller.start();
         expect(mockAdapterGetNetworkParameters).toHaveBeenCalledTimes(1);
-        expect(mockAdapterChangeChannel).toHaveBeenCalledWith(15);
+        const zdoPayload = Zdo.Buffalo.buildRequest(Zdo.ClusterId.NWK_UPDATE_REQUEST, false, [15], 0xfe, undefined, 0, undefined);
+        expect(mockAdapterSendZdo).toHaveBeenCalledWith(
+            ZSpec.BLANK_EUI64,
+            ZSpec.BroadcastAddress.SLEEPY,
+            Zdo.ClusterId.NWK_UPDATE_REQUEST,
+            zdoPayload,
+            true,
+        );
         expect(await controller.getNetworkParameters()).toEqual({panID: 1, channel: 15, extendedPanID: 3});
     });
 
@@ -4206,7 +4228,7 @@ describe('Controller', () => {
         await controller.start();
         await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
         const device = controller.getDeviceByIeeeAddr('0x129');
-        device.getEndpoint(1).zclCommandBroadcast(255, BroadcastAddress.SLEEPY, Zcl.Clusters.ssIasZone.ID, 'initTestMode', {});
+        device.getEndpoint(1).zclCommandBroadcast(255, ZSpec.BroadcastAddress.SLEEPY, Zcl.Clusters.ssIasZone.ID, 'initTestMode', {});
         const sentFrame = Zcl.Frame.create(
             Zcl.FrameType.SPECIFIC,
             Zcl.Direction.CLIENT_TO_SERVER,
@@ -4222,7 +4244,7 @@ describe('Controller', () => {
         expect(mocksendZclFrameToAll.mock.calls[0][0]).toBe(255);
         expect(deepClone(mocksendZclFrameToAll.mock.calls[0][1])).toStrictEqual(deepClone(sentFrame));
         expect(mocksendZclFrameToAll.mock.calls[0][2]).toBe(1);
-        expect(mocksendZclFrameToAll.mock.calls[0][3]).toBe(BroadcastAddress.SLEEPY);
+        expect(mocksendZclFrameToAll.mock.calls[0][3]).toBe(ZSpec.BroadcastAddress.SLEEPY);
         expect(mocksendZclFrameToAll).toHaveBeenCalledTimes(1);
     });
 
@@ -4239,7 +4261,7 @@ describe('Controller', () => {
         const options = {manufacturerCode: Zcl.ManufacturerCode.ROBERT_BOSCH_GMBH};
         device
             .getEndpoint(1)
-            .zclCommandBroadcast(255, BroadcastAddress.SLEEPY, Zcl.Clusters.ssIasZone.ID, 'boschSmokeAlarmSiren', {data: 0x0000}, options);
+            .zclCommandBroadcast(255, ZSpec.BroadcastAddress.SLEEPY, Zcl.Clusters.ssIasZone.ID, 'boschSmokeAlarmSiren', {data: 0x0000}, options);
         const sentFrame = Zcl.Frame.create(
             Zcl.FrameType.SPECIFIC,
             Zcl.Direction.CLIENT_TO_SERVER,
@@ -4255,7 +4277,7 @@ describe('Controller', () => {
         expect(mocksendZclFrameToAll.mock.calls[0][0]).toBe(255);
         expect(deepClone(mocksendZclFrameToAll.mock.calls[0][1])).toStrictEqual(deepClone(sentFrame));
         expect(mocksendZclFrameToAll.mock.calls[0][2]).toBe(1);
-        expect(mocksendZclFrameToAll.mock.calls[0][3]).toBe(BroadcastAddress.SLEEPY);
+        expect(mocksendZclFrameToAll.mock.calls[0][3]).toBe(ZSpec.BroadcastAddress.SLEEPY);
         expect(mocksendZclFrameToAll).toHaveBeenCalledTimes(1);
     });
 

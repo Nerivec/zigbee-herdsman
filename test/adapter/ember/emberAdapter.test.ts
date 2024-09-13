@@ -2762,7 +2762,7 @@ describe('Ember Adapter Layer', () => {
                 groupId: 0,
                 sequence: 0,
             };
-            // for coverage of stackComplianceResivion detection
+            // for coverage of stackComplianceRevision detection
             const serverMask = Zdo.Utils.createServerMask({
                 primaryTrustCenter: 0,
                 backupTrustCenter: 0,
@@ -2773,7 +2773,7 @@ describe('Ember Adapter Layer', () => {
                 networkManager: 0,
                 reserved1: 0,
                 reserved2: 0,
-                stackComplianceResivion: 0,
+                stackComplianceRevision: 0,
             });
 
             mockEzspSendUnicast.mockImplementationOnce(() => {
@@ -2832,7 +2832,7 @@ describe('Ember Adapter Layer', () => {
                 groupId: 0,
                 sequence: 0,
             };
-            // for coverage of stackComplianceResivion detection
+            // for coverage of stackComplianceRevision detection
             const serverMask = Zdo.Utils.createServerMask({
                 primaryTrustCenter: 0,
                 backupTrustCenter: 0,
@@ -2843,7 +2843,7 @@ describe('Ember Adapter Layer', () => {
                 networkManager: 0,
                 reserved1: 0,
                 reserved2: 0,
-                stackComplianceResivion: 21,
+                stackComplianceRevision: 21,
             });
 
             mockEzspSendUnicast.mockImplementationOnce(() => {

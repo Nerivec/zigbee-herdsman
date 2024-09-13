@@ -1,16 +1,16 @@
 /* istanbul ignore file */
 
-import {Buffalo} from '../../../buffalo';
-import {KeyValue} from '../../../controller/tstype';
 import * as Models from '../../../models';
 import {Queue, Wait, Waitress} from '../../../utils';
 import {logger} from '../../../utils/logger';
+import * as ZSpec from '../../../zspec';
 import {BroadcastAddress} from '../../../zspec/enums';
+import {EUI64} from '../../../zspec/tstypes';
 import * as Zcl from '../../../zspec/zcl';
+import * as Zdo from '../../../zspec/zdo';
 import Adapter from '../../adapter';
 import * as Events from '../../events';
 import * as TsType from '../../tstype';
-import {ActiveEndpoints, DeviceType, LQI, LQINeighbor, NodeDescriptor, SimpleDescriptor} from '../../tstype';
 import {RawAPSDataRequestPayload} from '../driver/commandType';
 import {ADDRESS_MODE, coordinatorEndpoints, DEVICE_TYPE, ZiGateCommandCode, ZiGateMessageCode, ZPSNwkKeyState} from '../driver/constants';
 import Driver from '../driver/zigate';
@@ -44,6 +44,7 @@ class ZiGateAdapter extends Adapter {
         adapterOptions: TsType.AdapterOptions,
     ) {
         super(networkOptions, serialPortOptions, backupPath, adapterOptions);
+        this.hasZdoMessageOverhead = false;
 
         this.joinPermitted = false;
         this.closing = false;
@@ -57,6 +58,40 @@ class ZiGateAdapter extends Adapter {
         this.driver.on('LeaveIndication', this.leaveIndicationListener.bind(this));
         this.driver.on('DeviceAnnounce', this.deviceAnnounceListener.bind(this));
         this.driver.on('close', this.onZiGateClose.bind(this));
+
+        Zdo.Buffalo.prototype.writeUInt16 = function (value: number): void {
+            // @ts-expect-error workaround
+            this.buffer.writeUInt16BE(value, this.position);
+            // @ts-expect-error workaround
+            this.position += 2;
+        };
+        Zdo.Buffalo.prototype.readUInt16 = function (): number {
+            // @ts-expect-error workaround
+            const value = this.buffer.readUInt16BE(this.position);
+            // @ts-expect-error workaround
+            this.position += 2;
+            return value;
+        };
+        Zdo.Buffalo.prototype.readUInt32 = function (): number {
+            // @ts-expect-error workaround
+            const value = this.buffer.readUInt32BE(this.position);
+            // @ts-expect-error workaround
+            this.position += 4;
+            return value;
+        };
+        Zdo.Buffalo.prototype.writeUInt32 = function (value: number): void {
+            // @ts-expect-error workaround
+            this.buffer.writeUInt32BE(value, this.position);
+            // @ts-expect-error workaround
+            this.position += 4;
+        };
+        Zdo.Buffalo.prototype.writeIeeeAddr = function (value: string /*TODO: EUI64*/): void {
+            this.writeUInt32(parseInt(value.slice(2, 10), 16));
+            this.writeUInt32(parseInt(value.slice(10), 16));
+        };
+        Zdo.Buffalo.prototype.readIeeeAddr = function (): EUI64 {
+            return `0x${this.readBuffer(8).toString('hex')}`;
+        };
     }
 
     /**
@@ -133,15 +168,25 @@ class ZiGateAdapter extends Adapter {
     }
 
     public async permitJoin(seconds: number, networkAddress?: number): Promise<void> {
-        const result = await this.driver.sendCommand(ZiGateCommandCode.PermitJoin, {
-            targetShortAddress: networkAddress || 0xfffc,
-            interval: seconds,
-            TCsignificance: 0,
-        });
+        // `authentication`: TC significance always 1 (zb specs)
+        const zdoPayload = Zdo.Buffalo.buildRequest(Zdo.ClusterId.PERMIT_JOINING_REQUEST, this.hasZdoMessageOverhead, seconds, 1, []);
+
+        // TODO: 0 === coordinator-only
+        const destination = networkAddress || ZSpec.BroadcastAddress.DEFAULT;
+
+        await this.sendZdo(
+            ZSpec.BLANK_EUI64,
+            destination,
+            Zdo.ClusterId.PERMIT_JOINING_REQUEST,
+            zdoPayload,
+            destination === ZSpec.BroadcastAddress.DEFAULT,
+        );
+
+        // above will throw if response status !== 0 and this will not be reached
+        this.joinPermitted = seconds > 0;
 
         // const result = await this.driver.sendCommand(ZiGateCommandCode.PermitJoinStatus, {});
         // Suitable only for the coordinator, not the entire network or point-to-point for routers
-        this.joinPermitted = result.payload.status === 0;
     }
 
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -194,309 +239,6 @@ class ZiGateAdapter extends Adapter {
         } catch (error) {
             throw new Error(`Set transmitpower failed ${error}`);
         }
-    }
-
-    public async lqi(networkAddress: number): Promise<TsType.LQI> {
-        return this.queue.execute<LQI>(async (): Promise<LQI> => {
-            const neighbors: LQINeighbor[] = [];
-
-            const add = (list: Buffer[]): void => {
-                for (const entry of list) {
-                    const relationByte = entry.readUInt8(18);
-                    const extAddr: Buffer = entry.subarray(8, 16);
-                    neighbors.push({
-                        linkquality: entry.readUInt8(21),
-                        networkAddress: entry.readUInt16LE(16),
-                        ieeeAddr: new Buffalo(extAddr).readIeeeAddr(),
-                        relationship: (relationByte >> 1) & ((1 << 3) - 1),
-                        depth: entry.readUInt8(20),
-                    });
-                }
-            };
-
-            const request = async (
-                startIndex: number,
-            ): Promise<{
-                status: number;
-                tableEntrys: number;
-                startIndex: number;
-                tableListCount: number;
-                tableList: Buffer[];
-            }> => {
-                try {
-                    const resultPayload = await this.driver.sendCommand(ZiGateCommandCode.ManagementLQI, {
-                        targetAddress: networkAddress,
-                        startIndex: startIndex,
-                    });
-                    const data = <Buffer>resultPayload.payload.payload;
-
-                    if (data[1] !== 0) {
-                        // status
-                        throw new Error(`LQI for '${networkAddress}' failed`);
-                    }
-                    const tableList: Buffer[] = [];
-                    const response = {
-                        status: data[1],
-                        tableEntrys: data[2],
-                        startIndex: data[3],
-                        tableListCount: data[4],
-                        tableList: tableList,
-                    };
-
-                    let tableEntry: number[] = [];
-                    let counter = 0;
-
-                    for (let i = 5; i < response.tableListCount * 22 + 5; i++) {
-                        // one tableentry = 22 bytes
-                        tableEntry.push(data[i]);
-                        counter++;
-                        if (counter === 22) {
-                            response.tableList.push(Buffer.from(tableEntry));
-                            tableEntry = [];
-                            counter = 0;
-                        }
-                    }
-
-                    logger.debug(
-                        'LQI RESPONSE - addr: ' +
-                            networkAddress.toString(16) +
-                            ' status: ' +
-                            response.status +
-                            ' read ' +
-                            (response.tableListCount + response.startIndex) +
-                            '/' +
-                            response.tableEntrys +
-                            ' entrys',
-                        NS,
-                    );
-                    return response;
-                } catch (error) {
-                    const msg = 'LQI REQUEST FAILED - addr: 0x' + networkAddress.toString(16) + ' ' + error;
-                    logger.error(msg, NS);
-                    throw new Error(msg);
-                }
-            };
-
-            let response = await request(0);
-            add(response.tableList);
-            let nextStartIndex = response.tableListCount;
-
-            while (neighbors.length < response.tableEntrys) {
-                response = await request(nextStartIndex);
-                add(response.tableList);
-                nextStartIndex += response.tableListCount;
-            }
-
-            return {neighbors};
-        }, networkAddress);
-    }
-
-    // @TODO
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    public routingTable(networkAddress: number): Promise<TsType.RoutingTable> {
-        return Promise.resolve({table: []});
-    }
-
-    public async nodeDescriptor(networkAddress: number): Promise<TsType.NodeDescriptor> {
-        return this.queue.execute<NodeDescriptor>(async () => {
-            try {
-                const nodeDescriptorResponse = await this.driver.sendCommand(ZiGateCommandCode.NodeDescriptor, {
-                    targetShortAddress: networkAddress,
-                });
-
-                const data: Buffer = <Buffer>nodeDescriptorResponse.payload.payload;
-                const buf = data;
-                const logicaltype = data[4] & 7;
-                let type: DeviceType = 'Unknown';
-                switch (logicaltype) {
-                    case 1:
-                        type = 'Router';
-                        break;
-                    case 2:
-                        type = 'EndDevice';
-                        break;
-                    case 0:
-                        type = 'Coordinator';
-                        break;
-                }
-                const manufacturer = buf.readUInt16LE(7);
-
-                logger.debug(
-                    'RECEIVING NODE_DESCRIPTOR - addr: 0x' +
-                        networkAddress.toString(16) +
-                        ' type: ' +
-                        type +
-                        ' manufacturer: 0x' +
-                        manufacturer.toString(16),
-                    NS,
-                );
-
-                return {manufacturerCode: manufacturer, type};
-            } catch (error) {
-                const msg = 'RECEIVING NODE_DESCRIPTOR FAILED - addr: 0x' + networkAddress.toString(16) + ' ' + error;
-                logger.error(msg, NS);
-                throw new Error(msg);
-            }
-        }, networkAddress);
-    }
-
-    public async activeEndpoints(networkAddress: number): Promise<TsType.ActiveEndpoints> {
-        return this.queue.execute<ActiveEndpoints>(async () => {
-            const payload = {
-                targetShortAddress: networkAddress,
-            };
-            try {
-                const result = await this.driver.sendCommand(ZiGateCommandCode.ActiveEndpoint, payload);
-                const buf = Buffer.from(<Buffer>result.payload.payload);
-                const epCount = buf.readUInt8(4);
-                const epList = [];
-                for (let i = 5; i < epCount + 5; i++) {
-                    epList.push(buf.readUInt8(i));
-                }
-
-                const payloadAE: TsType.ActiveEndpoints = {
-                    endpoints: <number[]>epList,
-                };
-
-                logger.debug(() => `ActiveEndpoints response: ${JSON.stringify(payloadAE)}`, NS);
-                return payloadAE;
-            } catch (error) {
-                logger.error(`RECEIVING ActiveEndpoints FAILED, ${error}`, NS);
-                throw new Error('RECEIVING ActiveEndpoints FAILED ' + error);
-            }
-        }, networkAddress);
-    }
-
-    public async simpleDescriptor(networkAddress: number, endpointID: number): Promise<TsType.SimpleDescriptor> {
-        return this.queue.execute<SimpleDescriptor>(async () => {
-            try {
-                const payload = {
-                    targetShortAddress: networkAddress,
-                    endpoint: endpointID,
-                };
-                const result = await this.driver.sendCommand(ZiGateCommandCode.SimpleDescriptor, payload);
-
-                const buf: Buffer = <Buffer>result.payload.payload;
-
-                if (buf.length > 11) {
-                    const inCount = buf.readUInt8(11);
-                    const inClusters = [];
-                    let cIndex = 12;
-                    for (let i = 0; i < inCount; i++) {
-                        inClusters[i] = buf.readUInt16LE(cIndex);
-                        cIndex += 2;
-                    }
-                    const outCount = buf.readUInt8(12 + inCount * 2);
-                    const outClusters = [];
-                    cIndex = 13 + inCount * 2;
-                    for (let l = 0; l < outCount; l++) {
-                        outClusters[l] = buf.readUInt16LE(cIndex);
-                        cIndex += 2;
-                    }
-
-                    const resultPayload: TsType.SimpleDescriptor = {
-                        profileID: buf.readUInt16LE(6),
-                        endpointID: buf.readUInt8(5),
-                        deviceID: buf.readUInt16LE(8),
-                        inputClusters: inClusters,
-                        outputClusters: outClusters,
-                    };
-
-                    return resultPayload;
-                }
-
-                throw new Error(`Invalid buffer length ${buf.length}.`);
-            } catch (error) {
-                const msg = 'RECEIVING SIMPLE_DESCRIPTOR FAILED - addr: 0x' + networkAddress.toString(16) + ' EP:' + endpointID + ' ' + error;
-                logger.error(msg, NS);
-                throw new Error(msg);
-            }
-        }, networkAddress);
-    }
-
-    public async bind(
-        destinationNetworkAddress: number,
-        sourceIeeeAddress: string,
-        sourceEndpoint: number,
-        clusterID: number,
-        destinationAddressOrGroup: string | number,
-        type: 'endpoint' | 'group',
-        destinationEndpoint?: number,
-    ): Promise<void> {
-        return this.queue.execute<void>(async () => {
-            const payload: KeyValue = {
-                targetExtendedAddress: sourceIeeeAddress,
-                targetEndpoint: sourceEndpoint,
-                clusterID: clusterID,
-                destinationAddressMode: type === 'group' ? ADDRESS_MODE.group : ADDRESS_MODE.ieee,
-                destinationAddress: destinationAddressOrGroup,
-            };
-
-            if (destinationEndpoint != undefined) {
-                payload.destinationEndpoint = destinationEndpoint;
-            }
-            const result = await this.driver.sendCommand(ZiGateCommandCode.Bind, payload, undefined, {destinationNetworkAddress});
-
-            const data = <Buffer>result.payload.payload;
-            if (data[1] === 0) {
-                logger.debug(`Bind ${sourceIeeeAddress} success`, NS);
-            } else {
-                const msg = `Bind ${sourceIeeeAddress} failed`;
-                logger.error(msg, NS);
-                throw new Error(msg);
-            }
-        }, destinationNetworkAddress);
-    }
-
-    public async unbind(
-        destinationNetworkAddress: number,
-        sourceIeeeAddress: string,
-        sourceEndpoint: number,
-        clusterID: number,
-        destinationAddressOrGroup: string | number,
-        type: 'endpoint' | 'group',
-        destinationEndpoint?: number,
-    ): Promise<void> {
-        return this.queue.execute<void>(async () => {
-            const payload: KeyValue = {
-                targetExtendedAddress: sourceIeeeAddress,
-                targetEndpoint: sourceEndpoint,
-                clusterID: clusterID,
-                destinationAddressMode: type === 'group' ? ADDRESS_MODE.group : ADDRESS_MODE.ieee,
-                destinationAddress: destinationAddressOrGroup,
-            };
-
-            if (destinationEndpoint != undefined) {
-                payload.destinationEndpoint = destinationEndpoint;
-            }
-            const result = await this.driver.sendCommand(ZiGateCommandCode.UnBind, payload, undefined, {destinationNetworkAddress});
-
-            const data = <Buffer>result.payload.payload;
-            if (data[1] === 0) {
-                logger.debug(`Unbind ${sourceIeeeAddress} success`, NS);
-            } else {
-                const msg = `Unbind ${sourceIeeeAddress} failed`;
-                logger.error(msg, NS);
-                throw new Error(msg);
-            }
-        }, destinationNetworkAddress);
-    }
-
-    public async removeDevice(networkAddress: number, ieeeAddr: string): Promise<void> {
-        return this.queue.execute<void>(async () => {
-            const payload = {
-                shortAddress: networkAddress,
-                extendedAddress: ieeeAddr,
-                rejoin: 0,
-                removeChildren: 0,
-            };
-
-            try {
-                await this.driver.sendCommand(ZiGateCommandCode.ManagementLeaveRequest, payload);
-            } catch (error) {
-                new Error(`ManagementLeaveRequest failed ${error}`);
-            }
-        }, networkAddress);
     }
 
     public async sendZclFrameToEndpoint(
@@ -685,6 +427,83 @@ class ZiGateAdapter extends Adapter {
 
             await this.driver.sendCommand(ZiGateCommandCode.RawAPSDataRequest, payload, undefined, {}, true);
             await Wait(200);
+        });
+    }
+
+    public async sendZdo(
+        ieeeAddress: string,
+        networkAddress: number,
+        clusterId: Zdo.ClusterId,
+        payload: Buffer,
+        disableResponse: boolean,
+    ): Promise<void>;
+    public async sendZdo<T>(
+        ieeeAddress: string,
+        networkAddress: number,
+        clusterId: Zdo.ClusterId,
+        payload: Buffer,
+        disableResponse: boolean,
+    ): Promise<T>;
+    public async sendZdo<T>(
+        ieeeAddress: string,
+        networkAddress: number,
+        clusterId: Zdo.ClusterId,
+        payload: Buffer,
+        disableResponse: boolean,
+    ): Promise<T | void> {
+        return this.queue.execute<T | void>(async () => {
+            // stack-specific requirements
+            switch (clusterId) {
+                case Zdo.ClusterId.PERMIT_JOINING_REQUEST: {
+                    const prefixedPayload = Buffer.alloc(payload.length + 2 - 1 /* TODO: no TC significance? */);
+                    prefixedPayload.writeUInt16BE(networkAddress, 0);
+                    prefixedPayload.set(payload.subarray(0, -1) /* TODO: no TC significance? */, 2);
+
+                    payload = prefixedPayload;
+                    break;
+                }
+
+                case Zdo.ClusterId.LQI_TABLE_REQUEST: {
+                    const prefixedPayload = Buffer.alloc(payload.length + 2);
+                    prefixedPayload.writeUInt16BE(networkAddress, 0);
+                    prefixedPayload.set(payload, 2);
+
+                    payload = prefixedPayload;
+                    break;
+                }
+
+                case Zdo.ClusterId.LEAVE_REQUEST: {
+                    const prefixedPayload = Buffer.alloc(payload.length + 3); // extra zero for deprecated `removeChildren`
+                    prefixedPayload.writeUInt16BE(networkAddress, 0);
+                    prefixedPayload.set(payload, 2);
+
+                    payload = prefixedPayload;
+                    break;
+                }
+
+                case Zdo.ClusterId.BIND_REQUEST:
+                case Zdo.ClusterId.UNBIND_REQUEST: {
+                    // extra zeroes for endpoint
+                    const zeroes = 15 - payload.length;
+                    const prefixedPayload = Buffer.alloc(payload.length + zeroes);
+                    prefixedPayload.set(payload, 0);
+
+                    payload = prefixedPayload;
+
+                    break;
+                }
+            }
+
+            await this.driver.requestZdo(clusterId, payload); // TODO
+
+            if (!disableResponse) {
+                const responseClusterId = Zdo.Utils.getResponseClusterId(clusterId);
+
+                if (responseClusterId) {
+                    // TODO: response from Zdo.Buffalo
+                    return response as T;
+                }
+            }
         });
     }
 
