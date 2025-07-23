@@ -35,8 +35,6 @@ export const busyQueue: Array<Request> = [];
 const apsQueue: Array<ApsRequest> = [];
 export const apsBusyQueue: Array<ApsRequest> = [];
 
-const DRIVER_EVENT = Symbol("drv_ev");
-
 const DEV_STATUS_NET_STATE_MASK = 0x03;
 const DEV_STATUS_APS_CONFIRM = 0x04;
 const DEV_STATUS_APS_INDICATION = 0x08;
@@ -179,14 +177,9 @@ class Driver extends events.EventEmitter {
             0x00,
         ]);
 
-        this.tickTimer = setInterval(() => {
-            this.tick();
-        }, 100);
+        this.tickTimer = setInterval(this.tick.bind(this), 100);
 
-        this.onParsed = this.onParsed.bind(this);
-        this.frameParserEvent.on("deviceStateUpdated", (data: number) => {
-            this.checkDeviceStatus(data);
-        });
+        this.frameParserEvent.on("deviceStateUpdated", this.checkDeviceStatus.bind(this));
 
         this.on("close", () => {
             for (const interval of this.intervals) {
@@ -195,10 +188,6 @@ class Driver extends events.EventEmitter {
 
             this.timeoutCounter = 0;
             this.cleanupAllQueues();
-        });
-
-        this.on(DRIVER_EVENT, (event, data) => {
-            this.handleStateEvent(event, data);
         });
     }
 
@@ -251,11 +240,7 @@ class Driver extends events.EventEmitter {
     }
 
     private tick(): void {
-        this.emitStateEvent(DriverEvent.Tick);
-    }
-
-    private emitStateEvent(event: DriverEvent, data?: DriverEventData) {
-        this.emit(DRIVER_EVENT, event, data);
+        this.handleStateEvent(DriverEvent.Tick);
     }
 
     private needWatchdogReset(): boolean {
@@ -311,7 +296,7 @@ class Driver extends events.EventEmitter {
         } else if (event === DriverEvent.Tick) {
             if (this.txState === TxState.WaitResponse) {
                 if (Date.now() - this.txTime > 2000) {
-                    this.emitStateEvent(DriverEvent.FirmwareCommandTimeout);
+                    this.handleStateEvent(DriverEvent.FirmwareCommandTimeout);
                 }
             }
         }
@@ -378,7 +363,7 @@ class Driver extends events.EventEmitter {
         } else if (event === DriverEvent.Connected) {
             this.driverStateStart = Date.now();
             this.driverState = DriverState.ReadConfiguration;
-            this.emitStateEvent(DriverEvent.Action);
+            this.handleStateEvent(DriverEvent.Action);
         }
     }
 
@@ -683,7 +668,7 @@ class Driver extends events.EventEmitter {
                         } else {
                             this.driverStateStart = Date.now();
                             this.driverState = DriverState.Reconfigure;
-                            this.emitStateEvent(DriverEvent.Action);
+                            this.handleStateEvent(DriverEvent.Action);
                         }
                     },
                 )
@@ -733,7 +718,7 @@ class Driver extends events.EventEmitter {
         if (event === DriverEvent.Tick) {
             if (5000 < Date.now() - this.driverStateStart) {
                 this.driverState = DriverState.Connecting;
-                this.emitStateEvent(DriverEvent.Action);
+                this.handleStateEvent(DriverEvent.Action);
             }
         }
     }
@@ -820,13 +805,13 @@ class Driver extends events.EventEmitter {
             logger.debug(`Port closed in state: ${DriverState[this.driverState]}`, NS);
         }
 
-        this.emitStateEvent(DriverEvent.Disconnected);
+        this.handleStateEvent(DriverEvent.Disconnected);
         this.emit("close");
     }
 
     private onPortError(error: Error): void {
         logger.error(`Port error: ${error}`, NS);
-        this.emitStateEvent(DriverEvent.Disconnected);
+        this.handleStateEvent(DriverEvent.Disconnected);
         this.emit("close");
     }
 
@@ -850,7 +835,7 @@ class Driver extends events.EventEmitter {
                 this.serialPort = new SerialPort({path, baudRate: baudrate, autoOpen: false});
                 this.writer.pipe(this.serialPort);
                 this.serialPort.pipe(this.parser);
-                this.parser.on("parsed", this.onParsed);
+                this.parser.on("parsed", this.onParsed.bind(this));
                 this.serialPort.on("close", this.onPortClose.bind(this));
                 this.serialPort.on("error", this.onPortError.bind(this));
             }
@@ -871,13 +856,13 @@ class Driver extends events.EventEmitter {
 
                     if (this.serialPort) {
                         if (this.serialPort.isOpen) {
-                            this.emitStateEvent(DriverEvent.ConnectError);
+                            this.handleStateEvent(DriverEvent.ConnectError);
                             //this.serialPort!.close();
                         }
                     }
                 } else {
                     logger.debug("Serialport opened", NS);
-                    this.emitStateEvent(DriverEvent.Connected);
+                    this.handleStateEvent(DriverEvent.Connected);
                     resolve();
                 }
             });
@@ -895,12 +880,9 @@ class Driver extends events.EventEmitter {
         this.socketPort.setNoDelay(true);
         this.socketPort.setKeepAlive(true, 15000);
 
-        this.writer = new Writer();
         this.writer.pipe(this.socketPort);
-
-        this.parser = new Parser();
         this.socketPort.pipe(this.parser);
-        this.parser.on("parsed", this.onParsed);
+        this.parser.on("parsed", this.onParsed.bind(this));
 
         return await new Promise((resolve, reject): void => {
             // biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
@@ -911,7 +893,7 @@ class Driver extends events.EventEmitter {
             // biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
             this.socketPort!.on("ready", () => {
                 logger.debug("Socket ready", NS);
-                this.emitStateEvent(DriverEvent.Connected);
+                this.handleStateEvent(DriverEvent.Connected);
                 resolve();
             });
 
@@ -939,22 +921,25 @@ class Driver extends events.EventEmitter {
                         if (error) {
                             // TODO(mpi): monitor, this must not happen after drain
                             // close() failes if there is pending data to write!
-                            this.emitStateEvent(DriverEvent.CloseError);
+                            this.handleStateEvent(DriverEvent.CloseError);
                             reject(new Error(`Error while closing serialport '${error}'`));
                             return;
                         }
                     });
                 }
 
-                this.emitStateEvent(DriverEvent.Disconnected);
+                this.handleStateEvent(DriverEvent.Disconnected);
+                clearInterval(this.tickTimer);
                 this.emit("close");
                 resolve();
             } else if (this.socketPort) {
                 this.socketPort.destroy();
                 this.socketPort = undefined;
-                this.emitStateEvent(DriverEvent.Disconnected);
+                this.handleStateEvent(DriverEvent.Disconnected);
+                clearInterval(this.tickTimer);
                 resolve();
             } else {
+                clearInterval(this.tickTimer);
                 resolve();
                 this.emit("close");
             }
@@ -1208,7 +1193,7 @@ class Driver extends events.EventEmitter {
         }
 
         const result = {cmd: frame[0], seq: frame[1]};
-        this.emitStateEvent(DriverEvent.FirmwareCommandSend, result);
+        this.handleStateEvent(DriverEvent.FirmwareCommandSend, result);
         return result;
     }
 
@@ -1300,7 +1285,7 @@ class Driver extends events.EventEmitter {
     private checkDeviceStatus(deviceStatus: number): void {
         this.deviceStatus = deviceStatus;
         this.configChanged = (deviceStatus >> 4) & 0x01;
-        this.emitStateEvent(DriverEvent.DeviceStateUpdated, deviceStatus);
+        this.handleStateEvent(DriverEvent.DeviceStateUpdated, deviceStatus);
     }
 
     public enqueueApsDataRequest(request: ApsDataRequest): Promise<undefined | ReceivedDataResponse> {
@@ -1311,7 +1296,7 @@ class Driver extends events.EventEmitter {
             const commandId = FirmwareCommand.ApsDataRequest;
             const req: ApsRequest = {commandId, seqNumber, request, resolve, reject, ts};
             apsQueue.push(req);
-            this.emitStateEvent(DriverEvent.EnqueuedApsDataRequest, req.seqNumber);
+            this.handleStateEvent(DriverEvent.EnqueuedApsDataRequest, req.seqNumber);
         });
     }
 
@@ -1522,7 +1507,7 @@ class Driver extends events.EventEmitter {
 
             if (crc === crcFrame) {
                 this.lastFirmwareRxTime = Date.now();
-                this.emitStateEvent(DriverEvent.FirmwareCommandReceived, {cmd: frame[0], seq: frame[1]});
+                this.handleStateEvent(DriverEvent.FirmwareCommandReceived, {cmd: frame[0], seq: frame[1]});
                 this.emit("rxFrame", frame.slice(0, storedLength));
             } else {
                 logger.debug("frame CRC invalid (could be ASCII message)", NS);
@@ -1530,10 +1515,6 @@ class Driver extends events.EventEmitter {
         } else {
             logger.debug(`frame length (${frame.length}) < 5, discard`, NS);
         }
-    }
-
-    private sleep(ms: number): Promise<void> {
-        return new Promise((resolve) => setTimeout(resolve, ms));
     }
 }
 
