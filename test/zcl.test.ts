@@ -565,15 +565,6 @@ describe("Zcl", () => {
             {
                 attrId: 65282,
                 dataType: 76,
-                numElms: 6,
-                structElms: [
-                    {elmType: 16, elmVal: 1},
-                    {elmType: 33, elmVal: 3022},
-                    {elmType: 33, elmVal: 17320},
-                    {elmType: 36, elmVal: 1},
-                    {elmType: 33, elmVal: 560},
-                    {elmType: 32, elmVal: 86},
-                ],
                 attrData: [
                     {elmType: 16, elmVal: 1},
                     {elmType: 33, elmVal: 3022},

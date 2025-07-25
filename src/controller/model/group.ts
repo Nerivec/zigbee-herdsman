@@ -1,4 +1,5 @@
 import assert from "node:assert";
+import type {TFoundation} from "src/zspec/zcl/definition/clusters-types";
 import {logger} from "../../utils/logger";
 import * as Zcl from "../../zspec/zcl";
 import type {CustomClusters} from "../../zspec/zcl/definition/tstype";
@@ -258,7 +259,7 @@ export class Group extends Entity {
         const optionsWithDefaults = this.getOptionsWithDefaults(options, Zcl.Direction.CLIENT_TO_SERVER);
         const customClusters = this.#customClusters[optionsWithDefaults.direction === Zcl.Direction.CLIENT_TO_SERVER ? 0 : 1];
         const cluster = Zcl.Utils.getCluster(clusterKey, undefined, customClusters);
-        const payload: {attrId: number; dataType: number; attrData: number | string | boolean}[] = [];
+        const payload: TFoundation["write"] = [];
 
         for (const [nameOrID, value] of Object.entries(attributes)) {
             if (cluster.hasAttribute(nameOrID)) {
@@ -305,7 +306,7 @@ export class Group extends Entity {
         const optionsWithDefaults = this.getOptionsWithDefaults(options, Zcl.Direction.CLIENT_TO_SERVER);
         const customClusters = this.#customClusters[optionsWithDefaults.direction === Zcl.Direction.CLIENT_TO_SERVER ? 0 : 1];
         const cluster = Zcl.Utils.getCluster(clusterKey, undefined, customClusters);
-        const payload: {attrId: number}[] = [];
+        const payload: TFoundation["read"] = [];
 
         for (const attribute of attributes) {
             payload.push({attrId: typeof attribute === "number" ? attribute : cluster.getAttribute(attribute).ID});

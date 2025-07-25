@@ -1,5 +1,5 @@
 import assert from "node:assert";
-
+import type {TFoundation} from "src/zspec/zcl/definition/clusters-types";
 import type {Events as AdapterEvents} from "../../adapter";
 import {logger} from "../../utils/logger";
 import * as ZSpec from "../../zspec";
@@ -12,7 +12,18 @@ import Request from "../helpers/request";
 import RequestQueue from "../helpers/requestQueue";
 import * as ZclFrameConverter from "../helpers/zclFrameConverter";
 import zclTransactionSequenceNumber from "../helpers/zclTransactionSequenceNumber";
-import type {KeyValue, SendPolicy} from "../tstype";
+import type {
+    AttributeKeysOfCluster,
+    AttributesOfCluster,
+    ClusterGenericPayload,
+    FoundationGenericPayload,
+    KeyValue,
+    ManualAttributes,
+    PartialAttributesOfCluster,
+    PayloadOfClusterCommand,
+    PayloadOfFoundationCommand,
+    SendPolicy,
+} from "../tstype";
 import Device from "./device";
 import Entity from "./entity";
 import Group from "./group";
@@ -276,7 +287,10 @@ export class Endpoint extends Entity {
 
     public saveClusterAttributeKeyValue(clusterKey: number | string, list: KeyValue): void {
         const cluster = this.getCluster(clusterKey);
-        if (!this.clusters[cluster.name]) this.clusters[cluster.name] = {attributes: {}};
+
+        if (!this.clusters[cluster.name]) {
+            this.clusters[cluster.name] = {attributes: {}};
+        }
 
         for (const [attribute, value] of Object.entries(list)) {
             this.clusters[cluster.name].attributes[attribute] = value;
@@ -357,31 +371,29 @@ export class Endpoint extends Entity {
     /*
      * Zigbee functions
      */
-    private checkStatus(payload: [{status: Zcl.Status}] | {cmdId: number; statusCode: number}): void {
-        const codes = Array.isArray(payload) ? payload.map((i) => i.status) : [payload.statusCode];
-        const invalid = codes.find((c) => c !== Zcl.Status.SUCCESS);
-        if (invalid) throw new Zcl.StatusError(invalid);
-    }
 
-    public async report(clusterKey: number | string, attributes: KeyValue, options?: Options): Promise<void> {
+    public async report<Cl extends number | string>(clusterKey: Cl, attributes: PartialAttributesOfCluster<Cl>, options?: Options): Promise<void> {
         const cluster = this.getCluster(clusterKey);
-        const payload: {attrId: number; dataType: number; attrData: number | string | boolean}[] = [];
+        const payload: TFoundation["report"] = [];
 
-        for (const [nameOrID, value] of Object.entries(attributes)) {
+        for (const nameOrID in attributes) {
             if (cluster.hasAttribute(nameOrID)) {
                 const attribute = cluster.getAttribute(nameOrID);
-                payload.push({attrId: attribute.ID, attrData: value, dataType: attribute.type});
+
+                payload.push({attrId: attribute.ID, attrData: attributes[nameOrID], dataType: attribute.type});
             } else if (!Number.isNaN(Number(nameOrID))) {
+                const value = attributes[nameOrID] as ManualAttributes[number];
+
                 payload.push({attrId: Number(nameOrID), attrData: value.value, dataType: value.type});
             } else {
                 throw new Error(`Unknown attribute '${nameOrID}', specify either an existing attribute or a number`);
             }
         }
 
-        await this.zclCommand(clusterKey, "report", payload, options, attributes);
+        await this.zclCommand(clusterKey, "report", Zcl.FrameType.GLOBAL, payload, options, attributes);
     }
 
-    public async write(clusterKey: number | string, attributes: KeyValue, options?: Options): Promise<void> {
+    public async write<Cl extends number | string>(clusterKey: Cl, attributes: PartialAttributesOfCluster<Cl>, options?: Options): Promise<void> {
         const cluster = this.getCluster(clusterKey);
         const optionsWithDefaults = this.getOptionsWithDefaults(options, true, Zcl.Direction.CLIENT_TO_SERVER, cluster.manufacturerCode);
         optionsWithDefaults.manufacturerCode = this.ensureManufacturerCodeIsUniqueAndGet(
@@ -390,36 +402,51 @@ export class Endpoint extends Entity {
             optionsWithDefaults.manufacturerCode,
             "write",
         );
+        const payload: TFoundation["write"] = [];
 
-        const payload: {attrId: number; dataType: number; attrData: number | string | boolean}[] = [];
-        for (const [nameOrID, value] of Object.entries(attributes)) {
+        for (const nameOrID in attributes) {
             if (cluster.hasAttribute(nameOrID)) {
                 const attribute = cluster.getAttribute(nameOrID);
-                payload.push({attrId: attribute.ID, attrData: value, dataType: attribute.type});
+
+                payload.push({attrId: attribute.ID, attrData: attributes[nameOrID], dataType: attribute.type});
             } else if (!Number.isNaN(Number(nameOrID))) {
+                const value = attributes[nameOrID] as ManualAttributes[number];
+
                 payload.push({attrId: Number(nameOrID), attrData: value.value, dataType: value.type});
             } else {
                 throw new Error(`Unknown attribute '${nameOrID}', specify either an existing attribute or a number`);
             }
         }
 
-        await this.zclCommand(clusterKey, optionsWithDefaults.writeUndiv ? "writeUndiv" : "write", payload, optionsWithDefaults, attributes, true);
+        await this.zclCommand(
+            clusterKey,
+            optionsWithDefaults.writeUndiv ? "writeUndiv" : "write",
+            Zcl.FrameType.GLOBAL,
+            payload,
+            optionsWithDefaults,
+            attributes,
+            true,
+        );
     }
 
-    public async writeResponse(
-        clusterKey: number | string,
+    public async writeResponse<Cl extends number | string>(
+        clusterKey: Cl,
         transactionSequenceNumber: number,
-        attributes: KeyValue,
+        attributes: Partial<Record<keyof AttributesOfCluster<Cl>, Pick<TFoundation["writeRsp"][number], "status">>>,
         options?: Options,
     ): Promise<void> {
         assert(options?.transactionSequenceNumber === undefined, "Use parameter");
         const cluster = this.getCluster(clusterKey);
-        const payload: {status: number; attrId: number}[] = [];
+        const payload: TFoundation["writeRsp"] = [];
 
-        for (const [nameOrID, value] of Object.entries(attributes)) {
+        for (const nameOrID in attributes) {
+            // biome-ignore lint/style/noNonNullAssertion: loop
+            const value = attributes[nameOrID]!;
+
             if (value.status !== undefined) {
                 if (cluster.hasAttribute(nameOrID)) {
                     const attribute = cluster.getAttribute(nameOrID);
+
                     payload.push({attrId: attribute.ID, status: value.status});
                 } else if (!Number.isNaN(Number(nameOrID))) {
                     payload.push({attrId: Number(nameOrID), status: value.status});
@@ -434,13 +461,18 @@ export class Endpoint extends Entity {
         await this.zclCommand(
             clusterKey,
             "writeRsp",
+            Zcl.FrameType.GLOBAL,
             payload,
             {direction: Zcl.Direction.SERVER_TO_CLIENT, ...options, transactionSequenceNumber},
             attributes,
         );
     }
 
-    public async read(clusterKey: number | string, attributes: (string | number)[], options?: Options): Promise<KeyValue> {
+    public async read<Cl extends number | string>(
+        clusterKey: Cl,
+        attributes: AttributeKeysOfCluster<Cl>,
+        options?: Options,
+    ): Promise<AttributesOfCluster<Cl> | Record<string, never>> {
         const device = this.getDevice();
         const cluster = this.getCluster(clusterKey, device);
         const optionsWithDefaults = this.getOptionsWithDefaults(options, true, Zcl.Direction.CLIENT_TO_SERVER, cluster.manufacturerCode);
@@ -450,13 +482,13 @@ export class Endpoint extends Entity {
             optionsWithDefaults.manufacturerCode,
             "read",
         );
+        const payload: TFoundation["read"] = [];
 
-        const payload: {attrId: number}[] = [];
         for (const attribute of attributes) {
             payload.push({attrId: typeof attribute === "number" ? attribute : cluster.getAttribute(attribute).ID});
         }
 
-        const resultFrame = await this.zclCommand(clusterKey, "read", payload, optionsWithDefaults, attributes, true);
+        const resultFrame = await this.zclCommand(clusterKey, "read", Zcl.FrameType.GLOBAL, payload, optionsWithDefaults, attributes, true);
 
         if (resultFrame) {
             return ZclFrameConverter.attributeKeyValue(resultFrame, device.manufacturerID, device.customClusters);
@@ -465,21 +497,25 @@ export class Endpoint extends Entity {
         return {};
     }
 
-    public async readResponse(
-        clusterKey: number | string,
+    public async readResponse<Cl extends string | number>(
+        clusterKey: Cl,
         transactionSequenceNumber: number,
-        attributes: KeyValue,
+        attributes: AttributesOfCluster<Cl>,
         options?: Options,
     ): Promise<void> {
         assert(options?.transactionSequenceNumber === undefined, "Use parameter");
 
         const cluster = this.getCluster(clusterKey);
-        const payload: {attrId: number; status: number; dataType: number; attrData: number | string}[] = [];
-        for (const [nameOrID, value] of Object.entries(attributes)) {
+        const payload: TFoundation["readRsp"] = [];
+
+        for (const nameOrID in attributes) {
             if (cluster.hasAttribute(nameOrID)) {
                 const attribute = cluster.getAttribute(nameOrID);
-                payload.push({attrId: attribute.ID, attrData: value, dataType: attribute.type, status: 0});
+
+                payload.push({attrId: attribute.ID, attrData: attributes[nameOrID], dataType: attribute.type, status: 0});
             } else if (!Number.isNaN(Number(nameOrID))) {
+                const value = attributes[nameOrID] as ManualAttributes[number];
+
                 payload.push({attrId: Number(nameOrID), attrData: value.value, dataType: value.type, status: 0});
             } else {
                 throw new Error(`Unknown attribute '${nameOrID}', specify either an existing attribute or a number`);
@@ -489,6 +525,7 @@ export class Endpoint extends Entity {
         await this.zclCommand(
             clusterKey,
             "readRsp",
+            Zcl.FrameType.GLOBAL,
             payload,
             {direction: Zcl.Direction.SERVER_TO_CLIENT, ...options, transactionSequenceNumber},
             attributes,
@@ -667,8 +704,18 @@ export class Endpoint extends Entity {
         options?: Options,
     ): Promise<void> {
         assert(options?.transactionSequenceNumber === undefined, "Use parameter");
-        const payload = {cmdId: commandID, statusCode: status};
-        await this.zclCommand(clusterID, "defaultRsp", payload, {direction: Zcl.Direction.SERVER_TO_CLIENT, ...options, transactionSequenceNumber});
+
+        await this.zclCommand(
+            clusterID,
+            "defaultRsp",
+            Zcl.FrameType.GLOBAL,
+            {cmdId: commandID, statusCode: status},
+            {
+                direction: Zcl.Direction.SERVER_TO_CLIENT,
+                ...options,
+                transactionSequenceNumber,
+            },
+        );
     }
 
     public async configureReporting(clusterKey: number | string, items: ConfigureReportingItem[], options?: Options): Promise<void> {
@@ -680,10 +727,9 @@ export class Endpoint extends Entity {
             optionsWithDefaults.manufacturerCode,
             "configureReporting",
         );
-
-        const payload = items.map((item): KeyValue => {
-            let dataType: number | undefined;
-            let attrId: number | undefined;
+        const payload = items.map((item) => {
+            let dataType: number;
+            let attrId: number;
 
             if (typeof item.attribute === "object") {
                 dataType = item.attribute.type;
@@ -692,19 +738,21 @@ export class Endpoint extends Entity {
                 const attribute = cluster.getAttribute(item.attribute);
                 dataType = attribute.type;
                 attrId = attribute.ID;
+            } else {
+                throw new Error(`Invalid attribute ${item.attribute} for cluster ${clusterKey}`);
             }
 
             return {
                 direction: Zcl.Direction.CLIENT_TO_SERVER,
-                attrId, // TODO: biome migration - can be undefined?
-                dataType, // TODO: biome migration - can be undefined?
+                attrId,
+                dataType,
                 minRepIntval: item.minimumReportInterval,
                 maxRepIntval: item.maximumReportInterval,
                 repChange: item.reportableChange,
             };
         });
 
-        await this.zclCommand(clusterKey, "configReport", payload, optionsWithDefaults, items, true);
+        await this.zclCommand(clusterKey, "configReport", Zcl.FrameType.GLOBAL, payload, optionsWithDefaults, items, true);
 
         for (const e of payload) {
             this._configuredReportings = this._configuredReportings.filter(
@@ -733,27 +781,32 @@ export class Endpoint extends Entity {
         this.save();
     }
 
-    public async writeStructured(clusterKey: number | string, payload: KeyValue, options?: Options): Promise<void> {
-        await this.zclCommand(clusterKey, "writeStructured", payload, options);
+    public async writeStructured<Cl extends number | string>(
+        clusterKey: Cl,
+        payload: TFoundation["writeStructured"],
+        options?: Options,
+    ): Promise<void> {
+        await this.zclCommand(clusterKey, "writeStructured", Zcl.FrameType.GLOBAL, payload, options);
         // TODO: support `writeStructuredResponse`
     }
 
-    public async command(
-        clusterKey: number | string,
-        commandKey: number | string,
-        payload: KeyValue,
+    public async command<Cl extends number | string, Co extends number | string>(
+        clusterKey: Cl,
+        commandKey: Co,
+        payload: PayloadOfClusterCommand<Cl, Co>,
         options?: Options,
-    ): Promise<undefined | KeyValue> {
-        const frame = await this.zclCommand(clusterKey, commandKey, payload, options, undefined, false, Zcl.FrameType.SPECIFIC);
+    ): Promise<undefined | ClusterGenericPayload> {
+        const frame = await this.zclCommand(clusterKey, commandKey, Zcl.FrameType.SPECIFIC, payload, options, undefined, false);
+
         if (frame) {
             return frame.payload;
         }
     }
 
-    public async commandResponse(
-        clusterKey: number | string,
-        commandKey: number | string,
-        payload: KeyValue,
+    public async commandResponse<Cl extends number | string, Co extends number | string>(
+        clusterKey: Cl,
+        commandKey: Co,
+        payload: PayloadOfClusterCommand<Cl, Co>,
         options?: Options,
         transactionSequenceNumber?: number,
     ): Promise<void> {
@@ -764,7 +817,6 @@ export class Endpoint extends Entity {
         const command = cluster.getCommandResponse(commandKey);
         transactionSequenceNumber = transactionSequenceNumber || zclTransactionSequenceNumber.next();
         const optionsWithDefaults = this.getOptionsWithDefaults(options, true, Zcl.Direction.SERVER_TO_CLIENT, cluster.manufacturerCode);
-
         const frame = Zcl.Frame.create(
             Zcl.FrameType.SPECIFIC,
             optionsWithDefaults.direction,
@@ -812,9 +864,9 @@ export class Endpoint extends Entity {
         }
     }
 
-    public waitForCommand(
-        clusterKey: number | string,
-        commandKey: number | string,
+    public waitForCommand<Cl extends number | string, Co extends number | string>(
+        clusterKey: Cl,
+        commandKey: Co,
         transactionSequenceNumber: number | undefined,
         timeout: number,
     ): {promise: Promise<{header: Zcl.Header; payload: KeyValue}>; cancel: () => void} {
@@ -833,7 +885,7 @@ export class Endpoint extends Entity {
             timeout,
         );
 
-        const promise = new Promise<{header: Zcl.Header; payload: KeyValue}>((resolve, reject) => {
+        const promise = new Promise<{header: Zcl.Header; payload: FoundationGenericPayload | ClusterGenericPayload}>((resolve, reject) => {
             waiter.promise.then(
                 (payload) => {
                     const frame = Zcl.Frame.fromBuffer(payload.clusterID, payload.header, payload.data, device.customClusters);
@@ -945,29 +997,29 @@ export class Endpoint extends Entity {
         }
     }
 
-    public async zclCommand(
-        clusterKey: number | string,
-        commandKey: number | string,
-        payload: KeyValue,
+    public async zclCommand<Cl extends number | string, Co extends number | string, Ft extends Zcl.FrameType>(
+        clusterKey: Cl,
+        commandKey: Co,
+        frameType: Ft,
+        payload: Ft extends Zcl.FrameType.GLOBAL ? PayloadOfFoundationCommand<Co> : PayloadOfClusterCommand<Cl, Co>,
         options?: Options,
         logPayload?: KeyValue,
         checkStatus = false,
-        frameType: Zcl.FrameType = Zcl.FrameType.GLOBAL,
-    ): Promise<undefined | Zcl.Frame> {
+    ): Promise<undefined | Zcl.Frame<Ft extends Zcl.FrameType.GLOBAL ? FoundationGenericPayload : ClusterGenericPayload>> {
         const device = this.getDevice();
         const cluster = this.getCluster(clusterKey, device);
         const command = frameType === Zcl.FrameType.GLOBAL ? Zcl.Utils.getGlobalCommand(commandKey) : cluster.getCommand(commandKey);
         const hasResponse = frameType === Zcl.FrameType.GLOBAL ? true : command.response !== undefined;
         const optionsWithDefaults = this.getOptionsWithDefaults(options, hasResponse, Zcl.Direction.CLIENT_TO_SERVER, cluster.manufacturerCode);
 
-        const frame = Zcl.Frame.create(
+        const frame = Zcl.Frame.create<Cl, Co, Ft>(
             frameType,
             optionsWithDefaults.direction,
             optionsWithDefaults.disableDefaultResponse,
             optionsWithDefaults.manufacturerCode,
             optionsWithDefaults.transactionSequenceNumber ?? zclTransactionSequenceNumber.next(),
-            command.name,
-            cluster.name,
+            command.name as Co,
+            cluster.name as Cl,
             payload,
             device.customClusters,
             optionsWithDefaults.reservedBits,
@@ -983,9 +1035,21 @@ export class Endpoint extends Entity {
 
             if (result) {
                 const resultFrame = Zcl.Frame.fromBuffer(result.clusterID, result.header, result.data, device.customClusters);
-                if (result && checkStatus && !optionsWithDefaults.disableResponse) {
-                    this.checkStatus(resultFrame.payload);
+
+                if (checkStatus && !optionsWithDefaults.disableResponse) {
+                    const resultPayload = resultFrame.payload;
+
+                    if (Array.isArray(resultPayload)) {
+                        const firstInvalid = resultPayload.find((val) => val.status !== Zcl.Status.SUCCESS);
+
+                        if (firstInvalid) {
+                            throw new Zcl.StatusError(firstInvalid.status);
+                        }
+                    } else if ("statusCode" in resultPayload && resultPayload.statusCode !== Zcl.Status.SUCCESS) {
+                        throw new Zcl.StatusError(resultPayload.statusCode as Zcl.Status);
+                    }
                 }
+
                 return resultFrame;
             }
         } catch (error) {
@@ -997,12 +1061,12 @@ export class Endpoint extends Entity {
         }
     }
 
-    public async zclCommandBroadcast(
+    public async zclCommandBroadcast<Cl extends number | string, Co extends number | string>(
         endpoint: number,
         destination: BroadcastAddress,
-        clusterKey: number | string,
-        commandKey: number | string,
-        payload: unknown,
+        clusterKey: Cl,
+        commandKey: Co,
+        payload: PayloadOfClusterCommand<Cl, Co>,
         options?: Options,
     ): Promise<void> {
         const device = this.getDevice();

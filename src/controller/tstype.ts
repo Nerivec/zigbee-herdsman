@@ -1,3 +1,7 @@
+import type {TClusters, TFoundation, TFoundationFlat, TFoundationOneOf, TFoundationRepetitive} from "src/zspec/zcl/definition/clusters-types";
+import type {FoundationDefinition} from "src/zspec/zcl/definition/foundation";
+import type {DataType} from "../zspec/zcl/definition/enums";
+
 export interface KeyValue {
     // biome-ignore lint/suspicious/noExplicitAny: API
     [s: string]: any;
@@ -37,3 +41,35 @@ export interface GreenPowerDeviceJoinedPayload {
     networkAddress: number;
     securityKey?: Buffer;
 }
+
+export type PartialAttributesOfCluster<Cl extends number | string> = Cl extends keyof TClusters
+    ? Partial<TClusters[Cl]["attributes"]>
+    : Record<string, unknown>;
+
+export type AttributesOfCluster<Cl extends number | string> = Cl extends keyof TClusters ? TClusters[Cl]["attributes"] : Record<string, unknown>;
+
+export type ManualAttributes = Record<number, {value: number; type: DataType}>;
+
+export type AttributeKeysOfCluster<Cl extends number | string> = Cl extends keyof TClusters
+    ? (keyof TClusters[Cl]["attributes"])[]
+    : (string | number)[];
+
+export type PayloadOfClusterCommand<Cl extends number | string, Co extends number | string> = Cl extends keyof TClusters
+    ? Co extends keyof TClusters[Cl]["commands"]
+        ? TClusters[Cl]["commands"][Co]
+        : Co extends keyof TClusters[Cl]["commandResponses"]
+          ? TClusters[Cl]["commandResponses"][Co]
+          : Record<string, unknown>
+    : Record<string, unknown>;
+
+export type ClusterGenericPayload = Record<string, unknown>;
+
+export type PayloadOfFoundationCommand<Co extends number | string> = Co extends keyof TFoundation ? TFoundation[Co] : Record<string, unknown>;
+
+export type FoundationGenericPayload = TFoundationRepetitive | TFoundationFlat | TFoundationOneOf;
+
+export type PayloadOfFoundationByType<T extends FoundationDefinition["parseStrategy"]> = T extends "repetitive"
+    ? TFoundationRepetitive
+    : T extends "flat"
+      ? TFoundationFlat
+      : TFoundationOneOf;

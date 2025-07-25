@@ -827,15 +827,6 @@ describe("ZCL Frame", () => {
             {
                 attrId: 65282,
                 dataType: Zcl.DataType.STRUCT,
-                numElms: 6,
-                structElms: [
-                    {elmType: Zcl.DataType.BOOLEAN, elmVal: 1},
-                    {elmType: Zcl.DataType.UINT16, elmVal: 3022},
-                    {elmType: Zcl.DataType.UINT16, elmVal: 17320},
-                    {elmType: Zcl.DataType.UINT40, elmVal: 1},
-                    {elmType: Zcl.DataType.UINT16, elmVal: 560},
-                    {elmType: Zcl.DataType.UINT8, elmVal: 86},
-                ],
                 attrData: [
                     {elmType: Zcl.DataType.BOOLEAN, elmVal: 1},
                     {elmType: Zcl.DataType.UINT16, elmVal: 3022},

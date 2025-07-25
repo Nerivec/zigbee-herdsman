@@ -416,6 +416,7 @@ export class Device extends Entity<ControllerEventMap> {
 
             if (frame.cluster.name in attributes) {
                 const response: KeyValue = {};
+
                 for (const entry of frame.payload) {
                     if (frame.cluster.hasAttribute(entry.attrId)) {
                         const name = frame.cluster.getAttribute(entry.attrId).name;

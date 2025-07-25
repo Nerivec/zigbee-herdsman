@@ -1,5 +1,12 @@
 import "../../utils/patchBigIntSerialization";
 
+import type {
+    ClusterGenericPayload,
+    FoundationGenericPayload,
+    PayloadOfClusterCommand,
+    PayloadOfFoundationByType,
+    PayloadOfFoundationCommand,
+} from "../../controller/tstype";
 import {BuffaloZcl} from "./buffaloZcl";
 import {BuffaloZclDataType, DataType, Direction, FrameType, ParameterCondition} from "./definition/enums";
 import type {FoundationCommandName} from "./definition/foundation";
@@ -7,9 +14,6 @@ import type {Status} from "./definition/status";
 import type {BuffaloZclOptions, Cluster, ClusterName, Command, CustomClusters, ParameterDefinition} from "./definition/tstype";
 import * as Utils from "./utils";
 import {ZclHeader} from "./zclHeader";
-
-// biome-ignore lint/suspicious/noExplicitAny: API
-type ZclPayload = any;
 
 const ListTypes: number[] = [
     BuffaloZclDataType.LIST_UINT8,
@@ -19,13 +23,13 @@ const ListTypes: number[] = [
     BuffaloZclDataType.LIST_ZONEINFO,
 ];
 
-export class ZclFrame {
+export class ZclFrame<P extends FoundationGenericPayload | ClusterGenericPayload = FoundationGenericPayload | ClusterGenericPayload> {
     public readonly header: ZclHeader;
-    public readonly payload: ZclPayload;
+    public readonly payload: P;
     public readonly cluster: Cluster;
     public readonly command: Command;
 
-    private constructor(header: ZclHeader, payload: ZclPayload, cluster: Cluster, command: Command) {
+    private constructor(header: ZclHeader, payload: P, cluster: Cluster, command: Command) {
         this.header = header;
         this.payload = payload;
         this.cluster = cluster;
@@ -39,18 +43,18 @@ export class ZclFrame {
     /**
      * Creating
      */
-    public static create(
-        frameType: FrameType,
+    public static create<Cl extends number | string, Co extends number | string, Ft extends FrameType>(
+        frameType: Ft,
         direction: Direction,
         disableDefaultResponse: boolean,
         manufacturerCode: number | undefined,
         transactionSequenceNumber: number,
-        commandKey: number | string,
-        clusterKey: number | string,
-        payload: ZclPayload,
+        commandKey: Co,
+        clusterKey: Cl,
+        payload: Ft extends FrameType.GLOBAL ? PayloadOfFoundationCommand<Co> : PayloadOfClusterCommand<Cl, Co>,
         customClusters: CustomClusters,
         reservedBits = 0,
-    ): ZclFrame {
+    ): ZclFrame<typeof payload> {
         const cluster = Utils.getCluster(clusterKey, manufacturerCode, customClusters);
         const command: Command =
             frameType === FrameType.GLOBAL
@@ -66,7 +70,7 @@ export class ZclFrame {
             command.ID,
         );
 
-        return new ZclFrame(header, payload, cluster, command);
+        return new ZclFrame<typeof payload>(header, payload, cluster, command);
     }
 
     public toBuffer(): Buffer {
@@ -87,61 +91,81 @@ export class ZclFrame {
     private writePayloadGlobal(buffalo: BuffaloZcl): void {
         const command = Utils.getFoundationCommand(this.command.ID);
 
-        if (command.parseStrategy === "repetitive") {
-            for (const entry of this.payload) {
-                for (const parameter of command.parameters) {
-                    const options: BuffaloZclOptions = {};
+        switch (command.parseStrategy) {
+            case "repetitive": {
+                for (const entry of this.payload as PayloadOfFoundationByType<typeof command.parseStrategy>) {
+                    for (const parameter of command.parameters) {
+                        const options: BuffaloZclOptions = {};
 
-                    if (!ZclFrame.conditionsValid(parameter, entry, undefined)) {
-                        continue;
+                        if (!ZclFrame.conditionsValid(parameter, entry, undefined)) {
+                            continue;
+                        }
+
+                        if (parameter.type === BuffaloZclDataType.USE_DATA_TYPE && typeof entry.dataType === "number") {
+                            // We need to grab the dataType to parse useDataType
+                            options.dataType = entry.dataType;
+                        }
+
+                        buffalo.write(parameter.type, entry[parameter.name as keyof typeof entry], options);
                     }
-
-                    if (parameter.type === BuffaloZclDataType.USE_DATA_TYPE && typeof entry.dataType === "number") {
-                        // We need to grab the dataType to parse useDataType
-                        options.dataType = entry.dataType;
-                    }
-
-                    buffalo.write(parameter.type, entry[parameter.name], options);
                 }
-            }
-        } else if (command.parseStrategy === "flat") {
-            for (const parameter of command.parameters) {
-                buffalo.write(parameter.type, this.payload[parameter.name], {});
-            }
-        } else {
-            if (command.parseStrategy === "oneof") {
-                if (Utils.isFoundationDiscoverRsp(command.ID)) {
-                    buffalo.writeUInt8(this.payload.discComplete);
 
-                    for (const entry of this.payload.attrInfos) {
+                break;
+            }
+
+            case "flat": {
+                for (const parameter of command.parameters) {
+                    const payload = this.payload as PayloadOfFoundationByType<typeof command.parseStrategy>;
+
+                    buffalo.write(parameter.type, payload[parameter.name as keyof typeof payload], {});
+                }
+
+                break;
+            }
+
+            case "oneof": {
+                if (Utils.isFoundationDiscoverRsp(command.ID)) {
+                    const payload = this.payload as PayloadOfFoundationByType<typeof command.parseStrategy>;
+
+                    buffalo.writeUInt8(payload.discComplete);
+
+                    for (const entry of payload.attrInfos) {
                         for (const parameter of command.parameters) {
-                            buffalo.write(parameter.type, entry[parameter.name], {});
+                            buffalo.write(parameter.type, entry[parameter.name as keyof typeof entry], {});
                         }
                     }
                 }
+
+                break;
             }
         }
     }
 
     private writePayloadCluster(buffalo: BuffaloZcl): void {
+        const payload = this.payload as ClusterGenericPayload;
+
         for (const parameter of this.command.parameters) {
-            if (!ZclFrame.conditionsValid(parameter, this.payload, undefined)) {
+            if (!ZclFrame.conditionsValid(parameter, payload, undefined)) {
                 continue;
             }
 
-            // TODO: biome migration - safer
-            if (this.payload[parameter.name] == null) {
+            if (payload[parameter.name] == null) {
                 throw new Error(`Parameter '${parameter.name}' is missing`);
             }
 
-            buffalo.write(parameter.type, this.payload[parameter.name], {});
+            buffalo.write(parameter.type, payload[parameter.name], {});
         }
     }
 
     /**
      * Parsing
      */
-    public static fromBuffer(clusterID: number, header: ZclHeader | undefined, buffer: Buffer, customClusters: CustomClusters): ZclFrame {
+    public static fromBuffer<T extends FoundationGenericPayload | ClusterGenericPayload>(
+        clusterID: number,
+        header: ZclHeader | undefined,
+        buffer: Buffer,
+        customClusters: CustomClusters,
+    ): ZclFrame<T> {
         if (!header) {
             throw new Error("Invalid ZclHeader.");
         }
@@ -155,10 +179,10 @@ export class ZclFrame {
               : cluster.getCommandResponse(header.commandIdentifier);
         const payload = ZclFrame.parsePayload(header, cluster, buffalo);
 
-        return new ZclFrame(header, payload, cluster, command);
+        return new ZclFrame<T>(header, payload as T, cluster, command);
     }
 
-    private static parsePayload(header: ZclHeader, cluster: Cluster, buffalo: BuffaloZcl): ZclPayload {
+    private static parsePayload(header: ZclHeader, cluster: Cluster, buffalo: BuffaloZcl): FoundationGenericPayload | ClusterGenericPayload {
         if (header.isGlobal) {
             return ZclFrame.parsePayloadGlobal(header, buffalo);
         }
@@ -170,12 +194,12 @@ export class ZclFrame {
         throw new Error(`Unsupported frameType '${header.frameControl.frameType}'`);
     }
 
-    private static parsePayloadCluster(header: ZclHeader, cluster: Cluster, buffalo: BuffaloZcl): ZclPayload {
+    private static parsePayloadCluster(header: ZclHeader, cluster: Cluster, buffalo: BuffaloZcl): ClusterGenericPayload {
         const command =
             header.frameControl.direction === Direction.CLIENT_TO_SERVER
                 ? cluster.getCommand(header.commandIdentifier)
                 : cluster.getCommandResponse(header.commandIdentifier);
-        const payload: ZclPayload = {};
+        const payload: ClusterGenericPayload = {};
 
         for (const parameter of command.parameters) {
             const options: BuffaloZclOptions = {payload};
@@ -199,123 +223,136 @@ export class ZclFrame {
         return payload;
     }
 
-    private static parsePayloadGlobal(header: ZclHeader, buffalo: BuffaloZcl): ZclPayload {
+    private static parsePayloadGlobal(header: ZclHeader, buffalo: BuffaloZcl): FoundationGenericPayload {
         const command = Utils.getFoundationCommand(header.commandIdentifier);
 
-        if (command.parseStrategy === "repetitive") {
-            const payload = [];
-
-            while (buffalo.isMore()) {
-                // biome-ignore lint/suspicious/noExplicitAny: API
-                const entry: {[s: string]: any} = {};
-
-                for (const parameter of command.parameters) {
-                    const options: BuffaloZclOptions = {};
-
-                    if (!ZclFrame.conditionsValid(parameter, entry, buffalo.getBuffer().length - buffalo.getPosition())) {
-                        continue;
-                    }
-
-                    if (parameter.type === BuffaloZclDataType.USE_DATA_TYPE && typeof entry.dataType === "number") {
-                        // We need to grab the dataType to parse useDataType
-                        options.dataType = entry.dataType;
-
-                        if (entry.dataType === DataType.CHAR_STR && entry.attrId === 65281) {
-                            // [workaround] parse char str as Xiaomi struct
-                            options.dataType = BuffaloZclDataType.MI_STRUCT;
-                        }
-                    }
-
-                    entry[parameter.name] = buffalo.read(parameter.type, options);
-
-                    // TODO: not needed, but temp workaroudn to make payload equal to that of zcl-packet
-                    // XXX: is this still needed?
-                    if (parameter.type === BuffaloZclDataType.USE_DATA_TYPE && entry.dataType === DataType.STRUCT) {
-                        entry.structElms = entry.attrData;
-                        entry.numElms = entry.attrData.length;
-                    }
-                }
-
-                payload.push(entry);
-            }
-
-            return payload;
-        }
-
-        if (command.parseStrategy === "flat") {
-            // biome-ignore lint/suspicious/noExplicitAny: API
-            const payload: {[s: string]: any} = {};
-
-            for (const parameter of command.parameters) {
-                payload[parameter.name] = buffalo.read(parameter.type, {});
-            }
-
-            return payload;
-        }
-
-        if (command.parseStrategy === "oneof") {
-            if (Utils.isFoundationDiscoverRsp(command.ID)) {
-                // biome-ignore lint/suspicious/noExplicitAny: API
-                const payload: {discComplete: number; attrInfos: {[k: string]: any}[]} = {
-                    discComplete: buffalo.readUInt8(),
-                    attrInfos: [],
-                };
+        switch (command.parseStrategy) {
+            case "repetitive": {
+                const payload: PayloadOfFoundationByType<typeof command.parseStrategy> = [];
 
                 while (buffalo.isMore()) {
-                    const entry: (typeof payload.attrInfos)[number] = {};
+                    const entry = {} as (typeof payload)[number];
 
                     for (const parameter of command.parameters) {
-                        entry[parameter.name] = buffalo.read(parameter.type, {});
+                        const options: BuffaloZclOptions = {};
+
+                        if (!ZclFrame.conditionsValid(parameter, entry, buffalo.getBuffer().length - buffalo.getPosition())) {
+                            continue;
+                        }
+
+                        if (parameter.type === BuffaloZclDataType.USE_DATA_TYPE && typeof entry.dataType === "number") {
+                            // We need to grab the dataType to parse useDataType
+                            options.dataType = entry.dataType;
+
+                            if (entry.dataType === DataType.CHAR_STR && entry.attrId === 65281) {
+                                // [workaround] parse char str as Xiaomi struct
+                                options.dataType = BuffaloZclDataType.MI_STRUCT;
+                            }
+                        }
+
+                        entry[parameter.name as keyof typeof entry] = buffalo.read(parameter.type, options);
                     }
 
-                    payload.attrInfos.push(entry);
+                    payload.push(entry);
                 }
 
                 return payload;
             }
+
+            case "flat": {
+                const payload = {} as PayloadOfFoundationByType<typeof command.parseStrategy>;
+
+                for (const parameter of command.parameters) {
+                    payload[parameter.name as keyof typeof payload] = buffalo.read(parameter.type, {});
+                }
+
+                return payload;
+            }
+
+            case "oneof": {
+                if (Utils.isFoundationDiscoverRsp(command.ID)) {
+                    const payload: PayloadOfFoundationByType<typeof command.parseStrategy> = {
+                        discComplete: buffalo.readUInt8(),
+                        attrInfos: [],
+                    };
+
+                    while (buffalo.isMore()) {
+                        const entry = {} as (typeof payload.attrInfos)[number];
+
+                        for (const parameter of command.parameters) {
+                            entry[parameter.name as keyof typeof entry] = buffalo.read(parameter.type, {});
+                        }
+
+                        payload.attrInfos.push(entry);
+                    }
+
+                    return payload;
+                }
+            }
         }
+
+        // XXX: typescript failing to detect no other possibility for `command.parseStrategy`?
+        throw new Error(`Unknown Foundation parsing strategy ${command.parseStrategy}`);
     }
 
     /**
      * Utils
      */
 
-    public static conditionsValid(parameter: ParameterDefinition, entry: ZclPayload, remainingBufferBytes: number | undefined): boolean {
+    public static conditionsValid(parameter: ParameterDefinition, entry: ClusterGenericPayload, remainingBufferBytes: number | undefined): boolean {
         if (parameter.conditions) {
             for (const condition of parameter.conditions) {
                 switch (condition.type) {
                     case ParameterCondition.STATUS_EQUAL: {
-                        if ((entry.status as Status) !== condition.value) return false;
+                        if ((entry.status as Status) !== condition.value) {
+                            return false;
+                        }
                         break;
                     }
                     case ParameterCondition.STATUS_NOT_EQUAL: {
-                        if ((entry.status as Status) === condition.value) return false;
+                        if ((entry.status as Status) === condition.value) {
+                            return false;
+                        }
                         break;
                     }
                     case ParameterCondition.DIRECTION_EQUAL: {
-                        if ((entry.direction as Direction) !== condition.value) return false;
+                        if ((entry.direction as Direction) !== condition.value) {
+                            return false;
+                        }
                         break;
                     }
                     case ParameterCondition.BITMASK_SET: {
                         if (condition.reversed) {
-                            if ((entry[condition.param] & condition.mask) === condition.mask) return false;
-                        } else if ((entry[condition.param] & condition.mask) !== condition.mask) return false;
+                            if (((entry[condition.param] as number) & condition.mask) === condition.mask) {
+                                return false;
+                            }
+                        } else if (((entry[condition.param] as number) & condition.mask) !== condition.mask) {
+                            return false;
+                        }
                         break;
                     }
                     case ParameterCondition.BITFIELD_ENUM: {
-                        if (((entry[condition.param] >> condition.offset) & ((1 << condition.size) - 1)) !== condition.value) return false;
+                        if ((((entry[condition.param] as number) >> condition.offset) & ((1 << condition.size) - 1)) !== condition.value) {
+                            return false;
+                        }
                         break;
                     }
                     case ParameterCondition.MINIMUM_REMAINING_BUFFER_BYTES: {
-                        if (remainingBufferBytes !== undefined && remainingBufferBytes < condition.value) return false;
+                        if (remainingBufferBytes !== undefined && remainingBufferBytes < condition.value) {
+                            return false;
+                        }
                         break;
                     }
                     case ParameterCondition.DATA_TYPE_CLASS_EQUAL: {
-                        if (Utils.getDataTypeClass(entry.dataType) !== condition.value) return false;
+                        if (Utils.getDataTypeClass(entry.dataType as DataType) !== condition.value) {
+                            return false;
+                        }
                         break;
                     }
                     case ParameterCondition.FIELD_EQUAL: {
-                        if (entry[condition.field] !== condition.value) return false;
+                        if (entry[condition.field] !== condition.value) {
+                            return false;
+                        }
                         break;
                     }
                 }

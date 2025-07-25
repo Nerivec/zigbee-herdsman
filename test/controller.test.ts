@@ -9398,7 +9398,7 @@ describe("Controller", () => {
         mocksendZclFrameToEndpoint.mockReturnValueOnce(null);
         let error;
         try {
-            await endpoint.zclCommand("genOnOff", "discover", {startAttrId: 1, maxAttrIds: 255});
+            await endpoint.zclCommand("genOnOff", "discover", Zcl.FrameType.GLOBAL, {startAttrId: 1, maxAttrIds: 255});
         } catch (e) {
             error = e;
         }
@@ -9414,7 +9414,7 @@ describe("Controller", () => {
         mocksendZclFrameToEndpoint.mockRejectedValueOnce(new Error("timeout occurred"));
         let error;
         try {
-            await endpoint.zclCommand("genOnOff", "discover", {startAttrId: 1, maxAttrIds: 255});
+            await endpoint.zclCommand("genOnOff", "discover", Zcl.FrameType.GLOBAL, {startAttrId: 1, maxAttrIds: 255});
         } catch (e) {
             error = e;
         }
